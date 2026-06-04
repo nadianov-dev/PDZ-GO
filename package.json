@@ -1,0 +1,22 @@
+{
+  "name": "pdz-go",
+  "private": true,
+  "description": "Local development tooling for Ventra GO PDZ Google Apps Script",
+  "scripts": {
+    "lint": "eslint \"PDZ 04.06.2026.txt\"",
+    "pretest": "node dev/verify-source.mjs",
+    "test": "node --test dev/smoke.test.mjs",
+    "posttest": "node dev/preview-email.mjs",
+    "preview:email": "node dev/preview-email.mjs",
+    "sync:check": "node dev/verify-source.mjs",
+    "clasp:status": "clasp status 2>/dev/null || echo 'clasp: run clasp login and set scriptId in .clasp.json'"
+  },
+  "devDependencies": {
+    "@google/clasp": "^2.5.0",
+    "@types/google-apps-script": "^1.0.97",
+    "eslint": "^8.57.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
