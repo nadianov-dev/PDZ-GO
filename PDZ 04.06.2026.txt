@@ -1,0 +1,4353 @@
+// @ts-nocheck
+/*******************************
+ *          КОНСТАНТЫ
+ *******************************/
+const DATE_FMT = "yyyy-MM-dd";
+const DEFAULT_HOLIDAYS = ["01-01","01-02","01-03","01-04","01-05","01-06","01-07","01-08","02-23","03-08","05-01","05-09","06-12","11-04"];
+
+const PDZ_MAIN_SPREADSHEET_ID = "1z48Ao7HZnhXL7YFSeFNzXUmjklWn0n5IUB52JIIoJ3M";
+const PDZ_IMPORT_SPREADSHEET_ID = "17md8kzD8xWHF10iXGLLOLWfdgKhQWvB7o9LOJH78E4I";
+const PDZ_IMPORT_SHEET_NAME = "Выгрузка";
+
+function getMainSpreadsheet_() {
+  return PDZ_MAIN_SPREADSHEET_ID
+    ? SpreadsheetApp.openById(PDZ_MAIN_SPREADSHEET_ID)
+    : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getImportSpreadsheet_() {
+  return SpreadsheetApp.openById(PDZ_IMPORT_SPREADSHEET_ID);
+}
+
+function getImportSheet_() {
+  const sh = getImportSpreadsheet_().getSheetByName(PDZ_IMPORT_SHEET_NAME);
+  if (!sh) {
+    throw new Error(`В таблице импорта не найден лист "${PDZ_IMPORT_SHEET_NAME}"`);
+  }
+  return sh;
+}
+
+function getSpreadsheetTimeZone_() {
+  try {
+    const ss = getMainSpreadsheet_();
+    const tz = ss && ss.getSpreadsheetTimeZone && ss.getSpreadsheetTimeZone();
+    if (tz) return tz;
+  } catch (e) {}
+  return Session.getScriptTimeZone() || "Europe/Samara";
+}
+
+
+
+const RUN_BUDGET_MS = 8 * 60 * 1000;   // бюджет одного прогона (если где-то используем батчи)
+const BATCH_REPLIES = 300;
+const BATCH_STAGES  = 1500;
+const BATCH_PAYLOG  = 1500;
+const BATCH_EMAIL_GROUPS = 100;
+const LOOKBACK_DAYS = 120;
+
+// Колонки
+const COLS = {
+  REGISTRY: {
+    NUMBER: "Номер",
+    CONTR: "Контрагент",
+    SUM: "Сумма",
+    DATE: "Дата",
+    ORG: "Организация",
+    FACT_INV_DATE: "Фактическая дата счета",
+    OWNER: "Ответственный",
+    DUE: "Срок оплаты",
+    PAY_STATUS: "Оплата",
+    COMMENT: "Комментарий",
+    ROOT: "Корневой проект",
+    CONTRACT: "Договор",
+    UPDATED_AT: "Дата обновления",
+    PAY_DATE: "Дата оплаты",
+    LOG: "Лог изменений",
+    STAGE: "Стадия",
+    OVERDUE: "Просрочка, дней",
+    TYPE: "Тип",
+    PROCESS_STATUS: "Статус обработки",
+    LAST_SENT_AT: "Время последней отправки"
+  }
+};
+
+// Бакеты писем
+const BUCKETS = [
+  "Новый счёт",
+  "1–3 дня до оплаты",
+  "Просрочка 1 день",
+  "Просрочка 7 дней",
+  "Просрочка 30 дней"
+];
+const SUBJECT_PREFIX = "Оплата счетов Ventra GO! — ";
+const BRAND = {
+  PURPLE:   "#6F2DBD",
+  PURPLE_D: "#5A23A0",
+  GRAY_BG:  "#F3F4F6",
+  BORDER:   "#D7DAE0",
+  TEXT:     "#111827",
+  MUTED:    "#6B7280"
+};
+
+/*******************************
+ *        LOGO
+ *******************************/
+const VENTRA_LOGO_URL =
+  "https://drive.google.com/uc?export=view&id=1u3hQfFcsPX8wAWXC1ylZRorm5Et3hgUt";
+
+function logoHtml_() {
+  return `
+    <div style="margin-bottom:20px;">
+      <img src="${VENTRA_LOGO_URL}"
+           alt="Ventra GO"
+           width="140"
+           style="display:block;max-width:140px;height:auto;">
+    </div>
+  `;
+}
+
+/*******************************
+ *       УТИЛИТЫ
+ *******************************/
+let _HOLIDAYS_CACHE = null;
+
+function getHolidays() {
+  if (_HOLIDAYS_CACHE) return _HOLIDAYS_CACHE;
+
+  const ss = getMainSpreadsheet_();
+  const sheet = ss.getSheetByName("Праздники");
+  if (!sheet) return (_HOLIDAYS_CACHE = new Set());
+
+  const tz = getSpreadsheetTimeZone_();
+
+  const values = sheet
+    .getRange(1, 1, sheet.getLastRow(), 1)
+    .getValues()
+    .flat()
+    .map(v => {
+      if (v instanceof Date && !isNaN(v)) {
+        return Utilities.formatDate(v, tz, "yyyy-MM-dd");
+      }
+      if (typeof v === "string") {
+        const m = v.trim().match(/(\d{2})\.(\d{2})\.(\d{4})/);
+        if (!m) return null;
+        return `${m[3]}-${m[2]}-${m[1]}`;
+      }
+      return null;
+    })
+    .filter(Boolean);
+
+  return (_HOLIDAYS_CACHE = new Set(values));
+}
+
+
+function addKAInfoIfNeeded_(contrName, introHtml) {
+  const name = normalizeKA_(contrName); // используем твою нормализацию
+
+  if (name.includes("АТАК") || name.includes("АШАН")) {
+    return introHtml + " КА Вентра, ИНН 7709307193";
+  }
+
+  return introHtml;
+}
+
+function mapStageToBucketByStage(stage) {
+  if (!stage) return null;
+
+  if (stage === "Ожидает оплаты") return "Новый счёт";
+
+  if (stage.includes("До оплаты") || stage.includes("За 3 дня"))
+    return "1–3 дня до оплаты";
+
+  if (stage.includes("Просрочка 1"))
+    return "Просрочка 1 день";
+
+  if (stage.includes(">7"))
+    return "Просрочка 7 дней";
+
+  if (stage.includes("30") || stage.includes("60"))
+    return "Просрочка 30 дней";
+
+  return null;
+}
+
+function shouldSendToday(bucket, daysDiff) {
+  if (bucket === "Новый счёт") return daysDiff <= -4;
+  if (bucket === "1–3 дня до оплаты") return daysDiff >= -3 && daysDiff <= -1;
+  if (bucket === "Просрочка 1 день") return daysDiff === 1;
+  if (bucket === "Просрочка 7 дней") return daysDiff >= 7;
+  if (bucket === "Просрочка 30 дней") return daysDiff >= 30;
+  return false;
+}
+
+function wasSentToday(lastDate, todayStr) {
+  return lastDate === todayStr;
+}
+
+function canRepeatSend(bucket, lastDate) {
+  if (!lastDate) return true;
+
+  const last = new Date(lastDate);
+  const days = Math.floor((new Date() - last) / (1000 * 3600 * 24));
+
+  if (bucket === "Просрочка 7 дней") return days >= 7;
+  if (bucket === "Просрочка 30 дней") return days >= 30;
+
+  return false;
+}
+
+
+
+function withLock_(fn){
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) throw new Error("Не удалось получить блокировку");
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function isHolidayOrWeekend(date) {
+  const day = date.getDay();
+  const tz = getSpreadsheetTimeZone_();
+  const ymd = Utilities.formatDate(date, tz, "yyyy-MM-dd");
+  const md = Utilities.formatDate(date, tz, "MM-dd");
+  return day === 0 || day === 6 || getHolidays().has(ymd) || DEFAULT_HOLIDAYS.includes(md);
+}
+
+function shiftToNextWorkday(date) {
+  const d = new Date(date);
+  while (isHolidayOrWeekend(d)) d.setDate(d.getDate() + 1);
+  return d;
+}
+function getColumnIndexes(header, names) {
+  const map = {};
+  names.forEach(n => map[n] = header.indexOf(n));
+  return map;
+}
+function detectDelimiter(text) { // по 5 строкам
+  const rows = text.split(/\r?\n/).slice(0, 5);
+  let comma = 0, semi = 0;
+  rows.forEach(r => { comma += (r.match(/,/g) || []).length; semi  += (r.match(/;/g) || []).length; });
+  return semi >= comma ? ";" : ",";
+}
+function normalizeToSheetColumns_(values, sheetCols) {
+  return values.map(row => {
+    if (row.length < sheetCols) return row.concat(Array(sheetCols - row.length).fill(""));
+    if (row.length > sheetCols) return row.slice(0, sheetCols);
+    return row;
+  });
+}
+function formatDateForCompare_(val) {
+  if (Object.prototype.toString.call(val) === "[object Date]") {
+    return Utilities.formatDate(val, getSpreadsheetTimeZone_(), DATE_FMT);
+  }
+  if (typeof val === "string") return val.trim();
+  return "";
+}
+function normalizeKA_(s) {
+  return (s || "")
+    .toString().trim().toUpperCase()
+    .replace(/[«»"'`]/g, "")
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/\b(ООО|АО|ПАО|ЗАО|ОАО|ИП)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function buildGreenSet_(greenSheet) {
+  const vals = greenSheet.getDataRange().getValues();
+  if (!vals.length) return new Set();
+  const hdr = vals[0].map(x => (x || "").toString().trim().toUpperCase());
+  let col = hdr.indexOf("КОНТРАГЕНТ");
+  if (col === -1) col = hdr.indexOf("КА");
+  if (col === -1) col = 0;
+  const set = new Set();
+  vals.slice(1).forEach(r => { const v = normalizeKA_(r[col]); if (v) set.add(v); });
+  return set;
+}
+
+function buildNoPushSet_(sheetNoPush) {
+  if (!sheetNoPush) return new Set();
+
+  const vals = sheetNoPush.getDataRange().getValues();
+  if (!vals.length) return new Set();
+
+  const hdr = vals[0].map(x => (x || "").toString().trim().toUpperCase());
+  let col = hdr.indexOf("КОНТРАГЕНТ");
+  if (col === -1) col = hdr.indexOf("КА");
+  if (col === -1) col = 0;
+
+  const set = new Set();
+  vals.slice(1).forEach(r => {
+    const v = normalizeKA_(r[col]);
+    if (v) set.add(v);
+  });
+  return set;
+}
+
+
+
+function esc(s){
+  return String(s ?? "").replace(/[&<>"']/g, c => (
+    { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;', "'":'&#39;' }[c]
+  ));
+}
+const DATE_FMT_EMAIL = "dd.MM.yyyy";
+
+function toNumberRu_(v){
+  if (v === "" || v === null || typeof v === "undefined") return null;
+  if (typeof v === "number") return isFinite(v) ? v : null;
+  const s = String(v).trim()
+    .replace(/\s+/g, "")     // убираем пробелы/разделители
+    .replace(/\u00A0/g, "")  // NBSP
+    .replace(",", ".");      // запятая -> точка
+  const n = Number(s);
+  return isFinite(n) ? n : null;
+}
+
+function fmtMoneyRu_(v){
+  const n = toNumberRu_(v);
+  if (n === null) return "-";
+  // ru-RU даст "100 324,45" (часто NBSP) — в письме это выглядит как обычный пробел
+  return n.toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtDateEmail_(v){
+  if (!v) return "-";
+  const tz = getSpreadsheetTimeZone_();
+
+  let d = null;
+  if (v instanceof Date && !isNaN(v)) d = v;
+  else {
+    // поддержка "yyyy-mm-dd" и "dd.mm.yyyy"
+    const s = String(v).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) d = new Date(s + "T00:00:00");
+    else {
+      const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+      if (m) d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+      else d = new Date(s);
+    }
+  }
+  if (!d || isNaN(d)) return "-";
+  return Utilities.formatDate(d, tz, DATE_FMT_EMAIL);
+}
+
+function readOSMap_() {
+  const ss = getMainSpreadsheet_();
+  const sh = ss.getSheetByName("Счета ОС");
+  if (!sh) return new Map();
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return new Map();
+
+  const hdr = (data[0] || []).map(x => (x || "").toString().trim());
+  const iNum  = hdr.indexOf("Номер");
+  const iDate = hdr.indexOf("Новая дата");
+  const iComm = hdr.indexOf("Комментарий"); // опционально
+  if (iNum === -1 || iDate === -1) throw new Error('В "Счета ОС" нужны колонки "Номер" и "Новая дата"');
+
+  const tz = getSpreadsheetTimeZone_();
+
+  const toYmd = (v) => {
+    if (!v) return null;
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+
+    const s = String(v).trim();
+    const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (m) {
+      const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+      return isNaN(d) ? null : Utilities.formatDate(d, tz, DATE_FMT);
+    }
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    const d2 = new Date(s);
+    return isNaN(d2) ? null : Utilities.formatDate(d2, tz, DATE_FMT);
+  };
+
+  const map = new Map();
+  for (let r = 1; r < data.length; r++) {
+    const num = (data[r][iNum] || "").toString().trim();
+    if (!num) continue;
+    const ymd = toYmd(data[r][iDate]);
+    if (!ymd) continue;
+
+    const comm = (iComm !== -1) ? (data[r][iComm] || "").toString().trim() : "";
+    map.set(num, { ymd, comm });
+  }
+  return map;
+}
+
+
+
+function _colA1(n) { let s=""; while(n>0){const m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=Math.floor((n-1)/26);} return s; }
+
+function _isNotPDZ_(reason) {
+  const s = (reason || "").toString()
+    .replace(/\u00A0/g, " ")   // NBSP → пробел
+    .trim()
+    .toLowerCase();
+  return s === "не пдз" || s === "непдз" || /^не\s*пд[зz]$/i.test(reason || "");
+}
+
+function _isPaid_(status) {
+  const s = (status || "").toString().trim().toLowerCase();
+  // Считаем закрытым любой статус, который начинается на "оплачен":
+  // "Оплачен", "Оплачен частично", "Оплачен частично (...)".
+  return s.startsWith("оплачен");
+}
+
+
+// === ПОИСК ПО ИМЕНИ ВЛОЖЕНИЯ: "Выставленные счета Go … на DD.MM.YYYY" ===
+const ATTACH_LOOKBACK_DAYS = 4;
+const ATTACH_SEARCH_DAYS = 14;
+const ATTACH_SEARCH_LIMIT = 400;
+
+
+function _norm(s) {
+  return (s || '')
+    .replace(/\u00A0/g, ' ')        // NBSP -> пробел
+    .replace(/[\u2013\u2014]/g, '-') // длинные тире -> дефис
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _extractDate(name) {
+  const n = _norm(name);
+  const m = n.match(/(\d{2})\s*[.\-\/]+\s*(\d{2})\s*[.\-\/]+\s*(\d{4})/);
+  if (!m) return null;
+  const [, dd, mm, yyyy] = m;
+  const d = new Date(`${yyyy}-${mm}-${dd}T00:00:00`);
+  return isNaN(d) ? null : d;
+}
+
+function _looksLikeTarget(name) {
+  const n = _norm(name).toLowerCase();
+  // ключевые слова в любом месте: "выставленные", "счета/счёта", "go"
+  return /выставленные/.test(n) && /сч[её]та/.test(n) && /\bgo\b/.test(n);
+}
+
+function _better(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.fileDate > b.fileDate) return a;
+  if (a.fileDate < b.fileDate) return b;
+  // если даты одинаковые — берём лексикографически «позднее» имя
+  return a.fileName.localeCompare(b.fileName, 'ru') >= 0 ? a : b;
+}
+
+/**
+ * Ищет письма с вложениями и выбирает файл с максимальной датой в имени
+ * за последние ATTACH_LOOKBACK_DAYS дней.
+ */
+function findLatestByAttachmentFilename_v3_() {
+  const now = new Date();
+  const start = new Date(now);
+  start.setDate(start.getDate() - ATTACH_LOOKBACK_DAYS);
+
+  const searchDays = Math.max(ATTACH_SEARCH_DAYS, ATTACH_LOOKBACK_DAYS, 1);
+  const threads = GmailApp.search(`in:anywhere newer_than:${searchDays}d has:attachment`, 0, ATTACH_SEARCH_LIMIT);
+  const candidates = [];
+  let best = null;
+
+  for (const th of threads) {
+    const msgs = th.getMessages() || [];
+    for (const m of msgs) {
+      const atts = m.getAttachments() || [];
+      for (const att of atts) {
+        const name = att.getName() || "";
+        if (!_looksLikeTarget(name)) continue;
+
+        const fileDate = _extractDate(name);
+        if (!fileDate) continue;
+        if (fileDate < start || fileDate > now) continue;
+
+        const cand = {
+          fileDate,
+          fileName: name,
+          att,
+          subject: m.getSubject(),
+          msgDate: m.getDate(),
+          from: m.getFrom(),
+          thread: th
+        };
+        candidates.push(cand);
+        best = _better(best, cand);
+      }
+    }
+  }
+
+  if (candidates.length) {
+    const tz = getSpreadsheetTimeZone_();
+    const log = candidates
+      .sort((a, b) => b.fileDate - a.fileDate || b.fileName.localeCompare(a.fileName, 'ru'))
+      .slice(0, 20)
+      .map((c, i) => `${i + 1}. ${Utilities.formatDate(c.fileDate, tz, DATE_FMT)} | ${c.fileName}`);
+    Logger.log(`Кандидаты (последние ${ATTACH_LOOKBACK_DAYS} дн.):\n${log.join('\n')}`);
+  }
+
+  return best;
+}
+
+/** Тест-обёртка: выводит результат или причину отсутствия */
+function testFindByAttachmentFilename_v3() {
+  const pick = findLatestByAttachmentFilename_v3_();
+  if (!pick) {
+    Logger.log(`За последние ${ATTACH_LOOKBACK_DAYS} дн. подходящих файлов не найдено.`);
+    return;
+  }
+
+  const tz = getSpreadsheetTimeZone_();
+  const msg = [
+    'Выбран файл:',
+    '• Имя: ' + pick.fileName,
+    '• Дата из имени: ' + Utilities.formatDate(pick.fileDate, tz, DATE_FMT),
+    '• Тема письма: ' + pick.subject,
+    '• Дата письма: ' + Utilities.formatDate(pick.msgDate, tz, 'yyyy-MM-dd HH:mm:ss'),
+    '• От: ' + pick.from
+  ].join('\n');
+  Logger.log(msg);
+  try {
+    SpreadsheetApp.getUi().alert('Результат', msg, SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (_) {}
+}
+
+
+// --- WATCHDOG & STATE (для безопасного выполнения по триггеру) ---
+const WATCHDOG_MS = 5 * 60 * 1000; // макс. время одного прохода (5 минут)
+
+function getState_() {
+  const p = PropertiesService.getScriptProperties();
+  try { return JSON.parse(p.getProperty('PIPE_STATE') || '{}'); } catch (e) { return {}; }
+}
+
+function setState_(s) {
+  PropertiesService.getScriptProperties().setProperty('PIPE_STATE', JSON.stringify(s || {}));
+}
+
+
+
+
+
+/*******************************
+ *   1) ИМПОРТ ИЗ GMAIL → внешняя таблица «Выгрузка»
+ *******************************/
+function readSheetValuesWithRetry_(fileId, maxWaitMs, stepMs) {
+  const deadline = Date.now() + (maxWaitMs || 90000);
+  let lastErr = null;
+  while (Date.now() < deadline) {
+    try {
+      const ssMeta = Sheets.Spreadsheets.get(fileId);
+      const gridSheet = (ssMeta.sheets || []).find(sh =>
+        sh.properties && sh.properties.sheetType === "GRID" && !sh.properties.hidden
+      ) || (ssMeta.sheets || [])[0];
+      if (!gridSheet || !gridSheet.properties) throw new Error("Пустой/неподдерживаемый файл (нет GRID-листа)");
+      const title = gridSheet.properties.title;
+      const rc = gridSheet.properties.gridProperties.rowCount || 2000;
+      const cc = gridSheet.properties.gridProperties.columnCount || 26;
+      const range = `${title}!A1:${_colA1(Math.min(cc,200))}${Math.min(rc,20000)}`;
+      const resp = Sheets.Spreadsheets.Values.get(fileId, range);
+      const values = resp.values || [];
+      if (values.length && values[0].length) {
+        const maxLen = Math.max(...values.map(r => r.length));
+        return values.map(r => r.length < maxLen ? r.concat(Array(maxLen - r.length).fill("")) : r);
+      }
+      lastErr = "Лист пуст или ещё не готов";
+    } catch (e) { lastErr = e.message; }
+    Utilities.sleep(stepMs || 3000);
+  }
+  throw new Error("Не удалось прочитать сконвертированный файл через Sheets API: " + (lastErr || "нет данных"));
+}
+
+// --- НАСТРОЙКА РЕЖИМА ---
+const REPLACE_TODAY_SNAPSHOT = false; // true = перезаписывать снимок дня, false = добавлять только новые
+
+
+
+function importLastExportFromMail() {
+  const DATE_COLUMN_NAME = "Дата обновления";
+  const target = getImportSheet_();
+
+  // НОВО: выбор вложения по имени "Выставленные счета Go ... на DD.MM.YYYY"
+  const pick = findLatestByAttachmentFilename_v3_();
+  if (!pick) throw new Error('За последние ' + ATTACH_LOOKBACK_DAYS + ' дн. нужных файлов не найдено');
+
+  const latestAtt  = pick.att;
+  const latestName = pick.fileName;
+  const latestDate = pick.fileDate;
+  if (!/\.(xlsx|xls|csv)$/i.test(latestName)) {
+    throw new Error('Найден файл "' + latestName + '", но он не .xlsx/.xls/.csv');
+  }
+  Logger.log('Выбран файл: ' + latestName + ' (дата в имени: ' +
+    Utilities.formatDate(latestDate, getSpreadsheetTimeZone_(), DATE_FMT) + ')');
+
+  // читаем вложение
+  let incoming;
+  if (/\.csv$/i.test(latestName)) {
+    const csvText = latestAtt.getDataAsString();
+    incoming = Utilities.parseCsv(csvText, detectDelimiter(csvText));
+  } else {
+    const tempFile = DriveApp.createFile(latestAtt.copyBlob());
+    let converted = null;
+    try {
+      converted = Drive.Files.insert(
+        { title: tempFile.getName(), mimeType: MimeType.GOOGLE_SHEETS },
+        tempFile.getBlob(),
+        { convert: true }
+      );
+      incoming = readSheetValuesWithRetry_(converted.id, 90000, 3000);
+    } finally {
+      try { tempFile.setTrashed(true); } catch(e) {}
+      if (converted && converted.id) { try { Drive.Files.trash(converted.id); } catch(e) {} }
+    }
+  }
+  if (!incoming || !incoming.length || !incoming[0].length) {
+    throw new Error("Получены пустые данные из вложения");
+  }
+
+  const tz = getSpreadsheetTimeZone_();
+  const todayStr = Utilities.formatDate(latestDate, tz, DATE_FMT);
+  const incomingHeader = incoming[0].map(h => (h || "").toString().trim());
+
+  // первичное заполнение (если лист пуст)
+  if (target.getLastRow() === 0) {
+    let header = incomingHeader.slice();
+    if (!header.includes(DATE_COLUMN_NAME)) header.push(DATE_COLUMN_NAME);
+    const body = incoming.slice(1).map(r => {
+      const row = r.slice();
+      if (row.length < header.length - 1) row.push(...Array(header.length - 1 - row.length).fill(""));
+      row.push(todayStr);
+      return row;
+    });
+    const toWrite = [header, ...body];
+    target.getRange(1, 1, toWrite.length, toWrite[0].length).setValues(toWrite);
+    Logger.log(`Импорт в "${PDZ_IMPORT_SHEET_NAME}" (первичное заполнение). Файл: ${latestName} от ${latestDate}`);
+    return;
+  }
+
+  // подготовка заголовка
+  let targetHeader = target.getRange(1, 1, 1, target.getLastColumn()).getValues()[0].map(x => (x||"").toString().trim());
+  let dateColIdxTarget = targetHeader.indexOf(DATE_COLUMN_NAME);
+  if (dateColIdxTarget === -1) {
+    targetHeader.push(DATE_COLUMN_NAME);
+    target.getRange(1, 1, 1, targetHeader.length).setValues([targetHeader]);
+    dateColIdxTarget = targetHeader.length - 1;
+  }
+  const numIdxIncoming = incomingHeader.indexOf("Номер");
+  const contrIdxIncoming = incomingHeader.indexOf("Контрагент");
+  const numIdxTarget = targetHeader.indexOf("Номер");
+  const contrIdxTarget = targetHeader.indexOf("Контрагент");
+  if (numIdxIncoming === -1 || contrIdxIncoming === -1 || numIdxTarget === -1 || contrIdxTarget === -1)
+    throw new Error("Нет колонок 'Номер' или 'Контрагент' во входных/целевых данных");
+
+  // при полном обновлении удаляем все сегодняшние строки
+  if (REPLACE_TODAY_SNAPSHOT) {
+    const lastRow = target.getLastRow();
+    const lastCol = target.getLastColumn();
+    if (lastRow > 1) {
+      const vals = target.getRange(2, 1, lastRow - 1, lastCol).getValues();
+      for (let r = vals.length - 1; r >= 0; r--) {
+        const d = vals[r][dateColIdxTarget];
+        const dStr = (d instanceof Date) ? Utilities.formatDate(d, tz, DATE_FMT) : (typeof d === "string" ? d.trim() : "");
+        if (dStr === todayStr) target.deleteRow(r + 2);
+      }
+    }
+  }
+
+  // маппинг колонок
+  const mapToTarget = new Map();
+  incomingHeader.forEach((name, idx) => {
+    const tIdx = targetHeader.indexOf(name);
+    if (tIdx !== -1 && name !== DATE_COLUMN_NAME) mapToTarget.set(idx, tIdx);
+  });
+
+  // антидубль
+  const keyToday = new Set();
+  if (!REPLACE_TODAY_SNAPSHOT) {
+    const lastRow = target.getLastRow();
+    const lastCol = target.getLastColumn();
+    if (lastRow > 1) {
+      const vals = target.getRange(2, 1, lastRow - 1, lastCol).getValues();
+      vals.forEach(r => {
+        const num = (r[numIdxTarget] || "").toString().trim();
+        const c   = (r[contrIdxTarget] || "").toString().trim();
+        const d   = r[dateColIdxTarget];
+        const dStr = (d instanceof Date) ? Utilities.formatDate(d, tz, DATE_FMT) : (typeof d === "string" ? d.trim() : "");
+        if (dStr === todayStr) keyToday.add(`${num}|${c}|${todayStr}`);
+      });
+    }
+  }
+
+  // формируем строки для вставки
+  const rowsToAppend = [];
+  for (let i = 1; i < incoming.length; i++) {
+    const srcRow = incoming[i];
+    if (srcRow.every(v => v === "" || v === null || typeof v === "undefined")) continue;
+
+    const destRow = Array(targetHeader.length).fill("");
+    mapToTarget.forEach((tIdx, sIdx) => { destRow[tIdx] = srcRow[sIdx]; });
+    destRow[dateColIdxTarget] = todayStr;
+
+    if (!REPLACE_TODAY_SNAPSHOT) {
+      const numVal = (destRow[numIdxTarget] || "").toString().trim();
+      const conVal = (destRow[contrIdxTarget] || "").toString().trim();
+      const k = `${numVal}|${conVal}|${todayStr}`;
+      if (keyToday.has(k)) continue;
+      keyToday.add(k);
+    }
+    rowsToAppend.push(destRow);
+  }
+
+  if (rowsToAppend.length > 0) {
+    target.getRange(target.getLastRow() + 1, 1, rowsToAppend.length, targetHeader.length).setValues(rowsToAppend);
+    Logger.log(`Добавлено строк в "${PDZ_IMPORT_SHEET_NAME}": ${rowsToAppend.length}. Файл: ${latestName} от ${latestDate}`);
+  } else {
+    Logger.log(`Новых строк нет в "${PDZ_IMPORT_SHEET_NAME}" (антидубль). Файл: ${latestName} от ${latestDate}`);
+  }
+}
+
+
+/**
+ * 2) СРОКИ ОПЛАТЫ + ДОБАВЛЕНИЕ/ОБНОВЛЕНИЕ В "Реестр" (батчево, без setValue/deleteRow в циклах)
+ */
+function updateDueDatesAndRegistry() {
+  const ss = getMainSpreadsheet_();
+  const sheetImport    = getImportSheet_();
+  const sheetContracts = ss.getSheetByName("Договора");
+  const sheetRegistry  = ss.getSheetByName("Реестр");
+
+  if (!sheetImport || !sheetContracts || !sheetRegistry) {
+    throw new Error(`Не найдены листы "${PDZ_IMPORT_SHEET_NAME}", "Договора" или "Реестр"`);
+  }
+
+  // стоп-лист (КА_RED)
+  const sheetRed = ss.getSheetByName("КА_RED") || ss.getSheetByName("KA_RED");
+  const redSet = sheetRed ? buildGreenSet_(sheetRed) : new Set();
+
+  const importData    = sheetImport.getDataRange().getValues();
+  const contractsData = sheetContracts.getDataRange().getValues();
+
+  if (importData.length < 2 || contractsData.length < 2) {
+    throw new Error(`Пустые листы "${PDZ_IMPORT_SHEET_NAME}" или "Договора"`);
+  }
+
+  // гарантируем заголовок в "Реестр"
+  if (sheetRegistry.getLastRow() === 0) {
+    sheetRegistry.getRange(1, 1, 1, 13).setValues([[
+      "Дата","Номер","Сумма","Контрагент","Организация",
+      "Фактическая дата счета","Ответственный","Срок оплаты",
+      "Оплата","Комментарий","Корневой проект","Договор","Дата обновления"
+    ]]);
+  }
+
+  // --- реестр (читаем один раз) ---
+  let registryData = sheetRegistry.getDataRange().getValues();
+  let regHeader = (registryData[0] || []).map(x => (x || "").toString().trim());
+
+  const idxReg = getColumnIndexes(regHeader, ["Номер","Контрагент","Срок оплаты","Сумма","Дата обновления"]);
+  if (idxReg["Номер"] === -1 || idxReg["Контрагент"] === -1) {
+    throw new Error('В "Реестре" нет колонок "Номер" и/или "Контрагент"');
+  }
+  if (idxReg["Сумма"] === -1) throw new Error('В "Реестре" нет колонки "Сумма"');
+
+  // ВАЖНО: не удаляем строки КА_RED из "Реестр".
+  // КА_RED используется как стоп-лист для новых добавлений/рассылки, но история в реестре должна сохраняться.
+
+  // --- индексы внешней выгрузки ---
+  const idxImp = getColumnIndexes(importData[0], [
+    "Корневой проект","Фактическая дата счета","Срок оплаты","Вариант отсрочки платежа",
+    "Номер","Контрагент","Дата","Сумма","Организация","Ответственный",
+    "Оплата","Комментарий","Договор","Дата обновления"
+  ]);
+
+  if (idxImp["Номер"] === -1 || idxImp["Контрагент"] === -1) {
+    throw new Error(`В "${PDZ_IMPORT_SHEET_NAME}" нет колонок "Номер" и/или "Контрагент"`);
+  }
+  if (idxImp["Сумма"] === -1) throw new Error(`В "${PDZ_IMPORT_SHEET_NAME}" нет колонки "Сумма"`);
+  if (idxImp["Дата обновления"] === -1) {
+    // если колонки нет — всё равно дедупаем по первому встретившемуся
+    Logger.log(`В "${PDZ_IMPORT_SHEET_NAME}" нет колонки "Дата обновления" — дедуп будет "первый встретился".`);
+  }
+
+  // --- словарь договоров ---
+  const idxCtr = getColumnIndexes(contractsData[0], [
+    "Корневой проект","Отсрочка контрактные условия, дней","Вариант отсрочки платежа"
+  ]);
+  const contractMap = new Map();
+  for (let i = 1; i < contractsData.length; i++) {
+    const r = contractsData[i];
+    const key = r[idxCtr["Корневой проект"]];
+    if (!key) continue;
+    contractMap.set(key, {
+      days: parseInt(r[idxCtr["Отсрочка контрактные условия, дней"]], 10),
+      postText: r[idxCtr["Вариант отсрочки платежа"]]
+    });
+  }
+
+  const tz = getSpreadsheetTimeZone_();
+
+  // --- helper: ключ счета ---
+  const makeKey_ = (num, contr) => {
+    const n = (num || "").toString().replace(/\u00A0/g, " ").trim();
+    const c = (contr || "").toString().replace(/\u00A0/g, " ").trim();
+    return `${n}|${c}`;
+  };
+
+  // --- helper: парс даты обновления для сравнения ---
+  const toYmd_ = (v) => {
+    if (!v) return "";
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+    const s = String(v).trim();
+    // dd.mm.yyyy
+    const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    // yyyy-mm-dd
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const d = new Date(s);
+    return isNaN(d) ? "" : Utilities.formatDate(d, tz, DATE_FMT);
+  };
+
+  // =====================================================================
+  // 1) ДЕДУП "Выгрузки": берём ТОЛЬКО одну (самую свежую) строку на key
+  // =====================================================================
+  const latestByKey = new Map(); // key -> { row, updYmd }
+  for (let i = 1; i < importData.length; i++) {
+    const row = importData[i];
+    if (row.every(v => v === "" || v == null)) continue;
+
+    const num   = row[idxImp["Номер"]];
+    const contr = row[idxImp["Контрагент"]];
+    const key = makeKey_(num, contr);
+    if (!key || key === "|") continue;
+
+    // RED фильтр сразу
+    const contrKey = normalizeKA_(contr);
+    if (redSet.has(contrKey)) continue;
+
+    const updYmd = idxImp["Дата обновления"] !== -1 ? toYmd_(row[idxImp["Дата обновления"]]) : "";
+
+    const prev = latestByKey.get(key);
+    if (!prev) {
+      latestByKey.set(key, { row, updYmd });
+    } else {
+      // сравнение по "Дата обновления" (как строка yyyy-mm-dd)
+      // если обе пустые — оставляем первую
+      if (updYmd && (!prev.updYmd || updYmd > prev.updYmd)) {
+        latestByKey.set(key, { row, updYmd });
+      }
+    }
+  }
+
+  // --- карта реестра: key -> индекс строки ---
+  const regMap = new Map();
+  for (let r = 1; r < registryData.length; r++) {
+    const key = makeKey_(registryData[r][idxReg["Номер"]], registryData[r][idxReg["Контрагент"]]);
+    if (!key || key === "|") continue;
+    // если в самом реестре уже есть дубль — сохраним первый (дальше отдельной чисткой займёмся)
+    if (!regMap.has(key)) regMap.set(key, r);
+  }
+
+  const updatedRowsToAppend = [];
+  const missingRows = [];
+  let registryChanged = false;
+  const changedRegIdxs = [];
+
+  // защита от дублей внутри одного прогона
+  const appendedKeys = new Set();
+
+  // =====================================================================
+  // 2) ОБРАБОТКА ТОЛЬКО latestByKey (1 строка на счёт)
+  // =====================================================================
+  latestByKey.forEach(({ row }, key) => {
+    const projectCode = row[idxImp["Корневой проект"]];
+    const contract = contractMap.get(projectCode);
+    if (!contract) {
+      missingRows.push(row);
+      return;
+    }
+
+    // Вариант отсрочки можно сохранить в "Выгрузке", но срок оплаты считаем только для "Реестра".
+    if (idxImp["Вариант отсрочки платежа"] !== -1) {
+      row[idxImp["Вариант отсрочки платежа"]] = contract.postText;
+    }
+
+    let dueValForRegistry = "";
+    const factDate = new Date(row[idxImp["Фактическая дата счета"]]);
+    if (!isNaN(factDate) && !isNaN(contract.days)) {
+      let dueDate = new Date(factDate);
+      dueDate.setDate(dueDate.getDate() + contract.days);
+      dueDate = shiftToNextWorkday(dueDate);
+      dueValForRegistry = Utilities.formatDate(dueDate, tz, DATE_FMT);
+    }
+
+    const regRowIdx = regMap.get(key);
+
+    if (regRowIdx == null) {
+      // новый — добавляем один раз
+      if (appendedKeys.has(key)) return;
+      appendedKeys.add(key);
+
+      updatedRowsToAppend.push([
+        row[idxImp["Дата"]],
+        row[idxImp["Номер"]],
+        row[idxImp["Сумма"]],
+        row[idxImp["Контрагент"]],
+        row[idxImp["Организация"]],
+        row[idxImp["Фактическая дата счета"]],
+        row[idxImp["Ответственный"]],
+        dueValForRegistry,
+        row[idxImp["Оплата"]],
+        row[idxImp["Комментарий"]],
+        row[idxImp["Корневой проект"]],
+        row[idxImp["Договор"]],
+        row[idxImp["Дата обновления"]]
+      ]);
+    } else {
+      // существующий — обновляем в массиве реестра (без setValue)
+      if (idxReg["Срок оплаты"] !== -1) {
+        if (dueValForRegistry && registryData[regRowIdx][idxReg["Срок оплаты"]] !== dueValForRegistry) {
+          registryData[regRowIdx][idxReg["Срок оплаты"]] = dueValForRegistry;
+          registryChanged = true;
+          changedRegIdxs.push(regRowIdx);
+        }
+      }
+      if (idxReg["Сумма"] !== -1 && idxImp["Сумма"] !== -1) {
+        const sumVal = row[idxImp["Сумма"]];
+        if (registryData[regRowIdx][idxReg["Сумма"]] !== sumVal) {
+          registryData[regRowIdx][idxReg["Сумма"]] = sumVal;
+          registryChanged = true;
+          changedRegIdxs.push(regRowIdx);
+        }
+      }
+      // можно также обновлять "Дата обновления" в реестре (если колонка есть)
+      if (idxReg["Дата обновления"] !== -1 && idxImp["Дата обновления"] !== -1) {
+        const updVal = row[idxImp["Дата обновления"]];
+        if (updVal && registryData[regRowIdx][idxReg["Дата обновления"]] !== updVal) {
+          registryData[regRowIdx][idxReg["Дата обновления"]] = updVal;
+          registryChanged = true;
+          changedRegIdxs.push(regRowIdx);
+        }
+      }
+    }
+  });
+
+  // 1) записываем внешнюю выгрузку одним setValues
+  {
+    const sheetColsImport = sheetImport.getLastColumn();
+    const normalizedImport = normalizeToSheetColumns_(importData, sheetColsImport);
+    sheetImport.getRange(1, 1, normalizedImport.length, sheetColsImport).setValues(normalizedImport);
+  }
+
+  // 2) если реестр менялся — перезаписываем блоком
+  if (registryChanged) {
+    const width = Math.max(sheetRegistry.getLastColumn(), registryData[0].length);
+    const normalizedReg = normalizeToSheetColumns_(registryData, width);
+    commitChangedRows_(sheetRegistry, normalizedReg, Array.from(new Set(changedRegIdxs)), width);
+  }
+
+  // 3) добавляем новые строки одним setValues
+  if (updatedRowsToAppend.length > 0) {
+    const startRow = sheetRegistry.getLastRow() + 1;
+    const width = sheetRegistry.getLastColumn();
+    const normalized = normalizeToSheetColumns_(updatedRowsToAppend, width);
+    sheetRegistry.getRange(startRow, 1, normalized.length, width).setValues(normalized);
+  }
+
+  // 4) ошибки
+  createErrorSheet(missingRows, importData[0]);
+}
+
+
+
+
+
+/**
+ * 3) ЛОГИКА ОПЛАТ/ЛОГОВ — батчевый commit изменённых строк
+ */
+function updatePaymentStatusLog(state) {
+  const ss = getMainSpreadsheet_();
+  const sheetReestr = ss.getSheetByName("Реестр");
+  const sheetVygruzka = getImportSheet_();
+
+  let dataReestr = sheetReestr.getDataRange().getValues();
+  let headerR = dataReestr[0];
+
+  const ensureCol = (name) => {
+    let col = headerR.indexOf(name);
+    if (col === -1) {
+      col = headerR.length;
+      sheetReestr.getRange(1, col + 1).setValue(name);
+      dataReestr = sheetReestr.getDataRange().getValues();
+      headerR = dataReestr[0];
+    }
+    return headerR.indexOf(name);
+  };
+
+  const idxUpdateDateR = ensureCol(COLS.REGISTRY.PAY_DATE);
+  const idxLogR = ensureCol(COLS.REGISTRY.LOG);
+
+  const idxNumR = headerR.indexOf(COLS.REGISTRY.NUMBER);
+  const idxContrR = headerR.indexOf(COLS.REGISTRY.CONTR);
+  const idxOpR = headerR.indexOf(COLS.REGISTRY.PAY_STATUS);
+
+  const dataVygruzka = sheetVygruzka.getDataRange().getValues();
+  const headerV = dataVygruzka[0];
+  const idxNumV = headerV.indexOf(COLS.REGISTRY.NUMBER);
+  const idxContrV = headerV.indexOf(COLS.REGISTRY.CONTR);
+  const idxOpV = headerV.indexOf(COLS.REGISTRY.PAY_STATUS);
+  const idxUpdateV = headerV.indexOf(COLS.REGISTRY.UPDATED_AT);
+  const tz = getSpreadsheetTimeZone_();
+
+  const makeKey_ = (num, contr) => {
+    const n = (num || "").toString().replace(/\u00A0/g, " ").trim();
+    const c = (contr || "").toString().replace(/\u00A0/g, " ").trim();
+    return `${n}|${c}`;
+  };
+
+  const toYmd_ = (v) => {
+    if (!v) return "";
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+    const s = String(v).trim();
+    const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const d = new Date(s);
+    return isNaN(d) ? "" : Utilities.formatDate(d, tz, DATE_FMT);
+  };
+
+  const mapVygruzka = new Map();
+  for (let i = 1; i < dataVygruzka.length; i++) {
+    const key = makeKey_(dataVygruzka[i][idxNumV], dataVygruzka[i][idxContrV]);
+    if (!key || key === "|") continue;
+
+    const updated = idxUpdateV !== -1 ? dataVygruzka[i][idxUpdateV] : "";
+    const updYmd = toYmd_(updated);
+    const prev = mapVygruzka.get(key);
+
+    if (!prev || (updYmd && (!prev.updYmd || updYmd > prev.updYmd))) {
+      mapVygruzka.set(key, {
+        status: dataVygruzka[i][idxOpV],
+        updated,
+        updYmd
+      });
+    }
+  }
+
+  const startRow = state?.paylogRow || 1;
+  const startTs = Date.now();
+
+  const changedIdxs = [];
+
+  for (let i = startRow; i < dataReestr.length; i++) {
+    const key = makeKey_(dataReestr[i][idxNumR], dataReestr[i][idxContrR]);
+    const match = mapVygruzka.get(key);
+    if (match) {
+      const statusReestr = dataReestr[i][idxOpR];
+      const statusNew = match.status;
+
+      if (statusReestr !== statusNew) {
+        dataReestr[i][idxOpR] = statusNew;
+
+        const prevLog = dataReestr[i][idxLogR] || "";
+        const logDate = Utilities.formatDate(new Date(), tz, DATE_FMT);
+        let newLogEntry = `${logDate}: статус изменён с '${statusReestr}' на '${statusNew}'`;
+
+        if (statusNew === "Оплачен" && match.updated) {
+          const paidDate = new Date(match.updated);
+          if (!isNaN(paidDate)) {
+            const paidFormatted = Utilities.formatDate(paidDate, tz, DATE_FMT);
+            dataReestr[i][idxUpdateDateR] = paidFormatted;
+            newLogEntry += `, дата оплаты: ${paidFormatted}`;
+          }
+        }
+
+        dataReestr[i][idxLogR] = prevLog ? `${prevLog}\n${newLogEntry}` : newLogEntry;
+        changedIdxs.push(i);
+      }
+    }
+
+    if (i % 200 === 0 && Date.now() - startTs > RUN_BUDGET_MS) {
+      commitChangedRows_(sheetReestr, dataReestr, changedIdxs, headerR.length);
+      return { paylogRow: i + 1 };
+    }
+  }
+
+  commitChangedRows_(sheetReestr, dataReestr, changedIdxs, headerR.length);
+  return { paylogRow: 1 };
+}
+
+/**
+ * Пишет изменённые строки пачками (по 500) — без setValue в циклах
+ */
+function commitChangedRows_(sheet, data, changedIdxs, width) {
+  if (!changedIdxs || changedIdxs.length === 0) return;
+
+  // сортируем — чтобы писать более “плотно”
+  changedIdxs.sort((a, b) => a - b);
+
+  const CHUNK = 500;
+  for (let p = 0; p < changedIdxs.length; p += CHUNK) {
+    const chunk = changedIdxs.slice(p, p + CHUNK);
+    // если индексы почти подряд — можно писать сплошным диапазоном
+    const first = chunk[0];
+    const last = chunk[chunk.length - 1];
+
+    const isDense = (last - first + 1) <= chunk.length * 1.3; // эвристика
+    if (isDense) {
+      const block = data.slice(first, last + 1);
+      sheet.getRange(first + 1, 1, block.length, width).setValues(block);
+    } else {
+      // редкие изменения — пишем строками, но всё равно без setValue (setValues на строку)
+      chunk.forEach(r => sheet.getRange(r + 1, 1, 1, width).setValues([data[r]]));
+    }
+  }
+}
+
+
+/*********************************************************
+ * 4) СТАДИИ/ПРОСРОЧКИ
+ *********************************************************/
+function updateStagesAndOverdueDays(state) {
+  const sheet = getMainSpreadsheet_().getSheetByName("Реестр");
+  if (!sheet) throw new Error('Лист "Реестр" не найден');
+
+  const data = sheet.getDataRange().getValues();
+  if (!data || data.length < 2) return { stagesRow: 1 };
+
+  let header = data[0];
+
+  const ensureCol = (name) => {
+    let col = header.indexOf(name);
+    if (col === -1) {
+      col = header.length;
+      sheet.getRange(1, col + 1).setValue(name);
+      header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+      data[0] = header;
+    }
+    return header.indexOf(name);
+  };
+
+  const idxDue    = header.indexOf(COLS.REGISTRY.DUE);
+  const idxOp     = header.indexOf(COLS.REGISTRY.PAY_STATUS);
+  const idxStage  = ensureCol(COLS.REGISTRY.STAGE);
+  const idxOverdue= ensureCol(COLS.REGISTRY.OVERDUE);
+  const idxType   = ensureCol(COLS.REGISTRY.TYPE);
+
+  if (idxDue === -1 || idxOp === -1) {
+    throw new Error('В "Реестр" нужны колонки: "Срок оплаты" и "Оплата"');
+  }
+
+  const today = new Date();
+  const width = header.length;
+
+  const startRow = (state && state.stagesRow) ? state.stagesRow : 1;
+  const startTs = Date.now();
+
+  const changed = [];
+
+  for (let i = startRow; i < data.length; i++) {
+    const row = data[i];
+
+    const status = row[idxOp];
+    const dueRaw = row[idxDue];
+
+    let stage = "";
+    let overdue = "";
+    let type = "";
+
+    const paid = _isPaid_(status);
+
+    if (!dueRaw || paid) {
+      stage = paid ? "Оплачен" : "Нет даты";
+      overdue = "";
+      type = paid ? row[idxType] : "";
+    } else {
+      const dueDate = new Date(dueRaw);
+      if (isNaN(dueDate)) {
+        stage = "Нет даты";
+        overdue = "";
+        type = "";
+      } else {
+        const daysDiff = Math.floor((today - dueDate) / (1000 * 3600 * 24));
+        type = (daysDiff > 0 ? "ПДЗ" : "ДЗ");
+        overdue = daysDiff;
+
+        if (daysDiff <= 0) {
+          if (daysDiff <= -4) stage = "Ожидает оплаты";
+          else if (daysDiff === -3) stage = "За 3 дня до оплаты";
+          else stage = `До оплаты ${Math.abs(daysDiff)} дн.`;
+        } else {
+          if (daysDiff >= 1 && daysDiff <= 3) stage = `Просрочка ${daysDiff} дн.`;
+          else if (daysDiff > 7) stage = "Просрочка >7 дней";
+          else stage = `Просрочка ${daysDiff} дн.`;
+        }
+      }
+    }
+
+    if (
+      row[idxStage] !== stage ||
+      row[idxOverdue] !== (paid ? "" : overdue) ||
+      row[idxType] !== type
+    ) {
+      data[i][idxStage] = stage;
+      data[i][idxOverdue] = paid ? "" : overdue;
+      data[i][idxType] = type;
+      changed.push(i);
+    }
+
+    if (i % 1000 === 0 && Date.now() - startTs > RUN_BUDGET_MS) {
+      commitChangedRows_(sheet, data, changed, width);
+      return { stagesRow: i + 1 };
+    }
+  }
+
+  commitChangedRows_(sheet, data, changed, width);
+  return { stagesRow: 1 };
+}
+
+
+
+/*********************************
+ * SUBJECT: понятная тема письма клиенту
+ *********************************/
+function subjectLabelHuman_(bucket) {
+  switch (bucket) {
+    case "Новый счёт":
+      return "Новый счет";
+
+    case "1–3 дня до оплаты":
+      return "Напоминание об оплате";
+
+    case "Просрочка 1 день":
+    case "Просрочка 7 дней":
+    case "Просрочка 30 дней":
+      return "Просрочка платежа";
+
+    default:
+      return "Оплата счетов";
+  }
+}
+
+function buildMailSubject_(bucket, contrName) {
+  const contr = (contrName || "").toString().trim();
+  const suffix = contr ? ` — ${contr}` : "";
+  return `[Ventra GO • Оплата] ${subjectLabelHuman_(bucket)}${suffix}`;
+}
+
+  function buildInvoiceEmailHtml_(params) {
+  const {
+    rowIdxs,
+    data,
+    idx,
+    osChangedByRow,
+    intro
+  } = params;
+  const firstRowIdx = rowIdxs[0];
+  const contrName = data[firstRowIdx][idx[COLS.REGISTRY.CONTR]];
+  const introFinal = addKAInfoIfNeeded_(contrName, intro);
+
+  let html = `
+<div style="font-family:Arial,Helvetica,sans-serif; background:#F5F6F8; padding:24px;">
+  <div style="background:#ffffff; padding:28px 24px 20px 24px;">
+    ${logoHtml_()}
+  </div>
+
+  <div style="background:#ffffff; padding:24px;">
+    <p style="margin:0 0 14px 0; font-size:15px;">
+      Уважаемые коллеги,
+    </p>
+
+    <p style="margin:0 0 20px 0; font-size:15px;">
+      ${introFinal}
+    </p>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse; font-size:14px;">
+      <tr style="border-bottom:2px solid #7E3ACE;">
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Номер</th>
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Дата</th>
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Дата формирования счета в 1С</th>
+        <th align="right" style="padding:12px 8px; color:#7E3ACE;">Сумма</th>
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Срок оплаты</th>
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Комментарий</th>
+        <th align="left" style="padding:12px 8px; color:#7E3ACE;">Изменение</th>
+      </tr>
+`;
+
+    rowIdxs.forEach((i, idxRow) => {
+     const invDate = fmtDateEmail_(data[i][idx[COLS.REGISTRY.DATE]]);
+     const dueStr  = fmtDateEmail_(data[i][idx[COLS.REGISTRY.DUE]]);
+     const sumStr  = fmtMoneyRu_(data[i][idx[COLS.REGISTRY.SUM]]);
+     const factKey = Object.keys(idx).find(k => k.includes("Фактическая"));
+     const factIdx = Number.isInteger(idx[COLS.REGISTRY.FACT_INV_DATE])
+      ? idx[COLS.REGISTRY.FACT_INV_DATE]
+      : factKey
+      ? idx[factKey]
+      : -1;
+
+     const factInvDate = fmtDateEmail_(factIdx !== -1 ? data[i][factIdx] : "");
+
+    const ch = osChangedByRow ? osChangedByRow.get(i) : null;
+    let changeTxt = "";
+    if (ch) {
+      const oldHuman = ch.oldYmd ? fmtDateEmail_(ch.oldYmd) : "—";
+      const newHuman = ch.newYmd ? fmtDateEmail_(ch.newYmd) : "—";
+      changeTxt = `Срок оплаты был изменен: ${oldHuman} → ${newHuman}` + (ch.comm ? `. ${ch.comm}` : "");
+    }
+
+    const borderBottom = (idxRow === rowIdxs.length - 1) ? "none" : "1px solid #E5E7EB";
+
+    html += `
+      <tr>
+        <td style="padding:12px 8px; border-bottom:${borderBottom}; font-weight:600;">
+          ${esc(data[i][idx[COLS.REGISTRY.NUMBER]])}
+        </td>
+
+       <td style="padding:12px 8px; border-bottom:${borderBottom}; color:#6B7280;">
+        ${esc(invDate)}
+         </td>
+
+       <td style="padding:12px 8px; border-bottom:${borderBottom}; color:#6B7280;">
+        ${esc(factInvDate)}
+        </td>
+
+       <td style="padding:12px 8px; border-bottom:${borderBottom}; text-align:right; font-weight:700;">
+        ${esc(sumStr)}
+        </td>
+
+         <td style="padding:12px 8px; border-bottom:${borderBottom}; font-weight:600;">
+         ${esc(dueStr)}
+         </td>
+
+        <td style="padding:12px 8px; border-bottom:${borderBottom};">
+          ${esc(data[i][idx[COLS.REGISTRY.COMMENT]] || "")}
+        </td>
+
+        <td style="padding:12px 8px; border-bottom:${borderBottom}; color:#6F2DBD;">
+          ${changeTxt ? esc(changeTxt) : "—"}
+        </td>
+      </tr>
+    `;
+  });
+
+  html += `
+    </table>
+
+    <p style="margin:24px 0 0 0; font-size:15px;">
+      Просим обеспечить оплату либо сообщить дату платежа.
+    </p>
+
+    <p style="margin:6px 0 0 0; font-size:14px; color:#6B7280;">
+      В случае вопросов — пожалуйста, свяжитесь с нами.
+    </p>
+
+    <p style="margin:20px 0 0 0; font-size:13px; font-weight:700; color:#FF4D4F;">
+      сообщение отправлено автоматически системой контроля оплаты счетов
+    </p>
+
+  </div>
+</div>
+`;
+
+  return html;
+}
+
+
+
+/*********************************************************
+ * 5) РАССЫЛКА ПИСЕМ КЛИЕНТАМ
+ *********************************************************/
+function sendStageEmails(state) {
+  if (isHolidayOrWeekend(new Date())) {
+    Logger.log("Рассылка отключена: выходной/праздник.");
+    return { emailGroupIndex: 0, done: true };
+  }
+
+   const ss = getMainSpreadsheet_();
+   const sheet = ss.getSheetByName("Реестр");
+   const mailSheet = ss.getSheetByName("Почта КА");
+   if (!mailSheet) throw new Error('Лист "Почта КА" не найден');
+
+   const greenSheet = ss.getSheetByName("СПИСОК КА_GREEN");
+
+   // NEW: стоп-лист рассылки
+  const redSheet = ss.getSheetByName("КА_RED") || ss.getSheetByName("KA_RED");
+  const redSet = redSheet ? buildGreenSet_(redSheet) : new Set();
+
+  let data = sheet.getDataRange().getValues();
+  let header = data[0];
+  const iReason = header.indexOf("Причина ПДЗ"); // ← ДОБАВИЛИ
+    // === 0) Перед рассылкой: применяем "Счета ОС" ===
+  const osMap = readOSMap_(); // num -> { ymd, comm }
+  const tz = getSpreadsheetTimeZone_();
+  const todayStr = Utilities.formatDate(new Date(), tz, DATE_FMT);
+
+
+  const ensureColLocal_ = (name) => {
+    let col = header.indexOf(name);
+    if (col === -1) {
+      col = header.length;
+      header.push(name);
+      data[0] = header;
+      for (let i = 1; i < data.length; i++) data[i].push("");
+      sheet.getRange(1, col + 1).setValue(name);
+    }
+    return col;
+  };
+
+  const iNumR   = header.indexOf(COLS.REGISTRY.NUMBER);  // "Номер"
+  const iDueR   = header.indexOf(COLS.REGISTRY.DUE);     // "Срок оплаты"
+  const iPayR   = header.indexOf(COLS.REGISTRY.PAY_STATUS);
+  const iStageR = header.indexOf(COLS.REGISTRY.STAGE);
+  const iOverR  = header.indexOf(COLS.REGISTRY.OVERDUE);
+  const iTypeR  = header.indexOf(COLS.REGISTRY.TYPE);
+
+  if ([iNumR, iDueR, iPayR].some(x => x === -1)) {
+    throw new Error('В "Реестр" нужны колонки: "Номер", "Срок оплаты", "Оплата"');
+  }
+
+  const iProcR   = ensureColLocal_(COLS.REGISTRY.PROCESS_STATUS);
+
+  // для письма: запомним изменения по строкам реестра
+  const osChangedByRow = new Map(); // rowIndex -> { oldYmd, newYmd, comm }
+
+  const today = new Date();
+
+  const toYmdFromCell_ = (v) => {
+    if (!v) return "";
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+    const s = String(v).trim();
+    // dd.mm.yyyy
+    const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+    return s;
+  };
+
+  // точечно применяем ОС: обновляем due + пересчитываем stage/overdue/type для этих строк
+  for (let r = 1; r < data.length; r++) {
+    if (_isPaid_(data[r][iPayR])) continue;
+
+    const num = (data[r][iNumR] || "").toString().trim();
+    if (!num) continue;
+
+    const hit = osMap.get(num);
+    if (!hit) continue;
+
+    const oldYmd = toYmdFromCell_(data[r][iDueR]);
+    const newYmd = hit.ymd;
+
+    // если реально изменили дату
+    if (newYmd && oldYmd && newYmd !== oldYmd) {
+      osChangedByRow.set(r, { oldYmd, newYmd, comm: hit.comm || "" });
+    } else if (newYmd && !oldYmd) {
+      osChangedByRow.set(r, { oldYmd: "", newYmd, comm: hit.comm || "" });
+    }
+
+    // проставляем поля без дополнительных служебных колонок
+    data[r][iDueR]  = newYmd;
+    data[r][iProcR] = hit.comm ? `ОС: ${hit.comm}` : "ОС: подтверждена новая дата";
+
+    // пересчет stage/overdue/type от новой даты
+    if (iStageR !== -1 && iOverR !== -1 && iTypeR !== -1) {
+      const dueDate = new Date(newYmd + "T00:00:00");
+      if (!isNaN(dueDate)) {
+        const daysDiff = Math.floor((today - dueDate) / (1000 * 3600 * 24));
+        const typeBase = daysDiff > 0 ? "ПДЗ" : "ДЗ";
+        const changedDate = (newYmd && oldYmd && newYmd !== oldYmd) || (newYmd && !oldYmd);
+        data[r][iOverR] = daysDiff;
+        data[r][iTypeR] = `${typeBase}${changedDate ? "_CHANGE" : ""}`;
+
+
+        // стадия по твоей логике (упрощенно как в updateStagesAndOverdueDays)
+        if (daysDiff <= 0) {
+          if (daysDiff <= -4) data[r][iStageR] = "Ожидает оплаты";
+          else if (daysDiff === -3) data[r][iStageR] = "За 3 дня до оплаты";
+          else data[r][iStageR] = `До оплаты ${Math.abs(daysDiff)} дн.`;
+        } else {
+          if (daysDiff >= 1 && daysDiff <= 3) data[r][iStageR] = `Просрочка ${daysDiff} дн.`;
+          else if (daysDiff > 7) data[r][iStageR] = "Просрочка >7 дней";
+          else data[r][iStageR] = `Просрочка ${daysDiff} дн.`;
+        }
+      }
+    }
+  }
+
+
+
+  const idx = getColumnIndexes(header, [
+    COLS.REGISTRY.STAGE, COLS.REGISTRY.CONTR, COLS.REGISTRY.NUMBER, COLS.REGISTRY.DATE, COLS.REGISTRY.SUM,
+    COLS.REGISTRY.DUE, COLS.REGISTRY.COMMENT, COLS.REGISTRY.PROCESS_STATUS, COLS.REGISTRY.LAST_SENT_AT, COLS.REGISTRY.OVERDUE,COLS.REGISTRY.FACT_INV_DATE
+  ]);
+
+  const ensureCol = (name) => {
+    let col = header.indexOf(name);
+    if (col === -1) {
+      col = header.length;
+      header.push(name);
+      data[0] = header;
+      for (let i = 1; i < data.length; i++) data[i].push("");
+      sheet.getRange(1, col + 1).setValue(name);
+    }
+    return col;
+  };
+  idx[COLS.REGISTRY.PROCESS_STATUS] = ensureCol(COLS.REGISTRY.PROCESS_STATUS);
+  idx[COLS.REGISTRY.LAST_SENT_AT]   = ensureCol(COLS.REGISTRY.LAST_SENT_AT);
+
+  const stageCols = {};
+  BUCKETS.forEach(b => {
+    const dName = `Письмо: ${b}`;
+    const cName = `Кол-во: Письмо: ${b}`;
+    const dIdx = ensureCol(dName);
+    const cIdx = ensureCol(cName);
+    stageCols[b] = { dateIdx: dIdx, countIdx: cIdx };
+  });
+
+  const mailVals = mailSheet.getDataRange().getValues();
+  const mailHdr = mailVals[0] || [];
+  const idxMail = getColumnIndexes(mailHdr, ["Контрагент","Почта","CSM"]);
+  const mailMap = new Map();
+  mailVals.slice(1).forEach(r => {
+    const contr = normalizeKA_(r[idxMail["Контрагент"]]);
+    if (contr) mailMap.set(contr, { client: r[idxMail["Почта"]], csm: r[idxMail["CSM"]] });
+  });
+
+  const greenSet = greenSheet ? buildGreenSet_(greenSheet) : new Set();
+  const hasGreen = greenSet.size > 0;
+    // NEW: лист КА без рассылки (но участвуют в реестре/аналитике)
+  const noPushSheet = ss.getSheetByName("KA_No push");
+  const noPushSet = noPushSheet ? buildNoPushSet_(noPushSheet) : new Set();
+
+
+  function mapStageToBucketByDays(daysDiff, stageText) {
+    // до даты оплаты
+    if (Number.isFinite(daysDiff) && daysDiff < 0) {
+      // -3, -2, -1 -> «1–3 дня до оплаты», все что <= -4 считаем «Новый счёт»
+      if (daysDiff >= -3) return "1–3 дня до оплаты";
+      return "Новый счёт";
+    }
+
+    // в дату оплаты нет отдельного письма
+    if (daysDiff === 0) return null;
+
+    // просрочка
+    if (Number.isFinite(daysDiff) && daysDiff > 0) {
+      if (daysDiff === 1) return "Просрочка 1 день";
+      if (daysDiff >= 30) return "Просрочка 30 дней";
+      if (daysDiff >= 7) return "Просрочка 7 дней";
+      return "Просрочка 1 день";
+    }
+
+    // fallback на текст, если число не распарсилось
+    const s = (stageText || "").toString();
+    if (/Ожидает оплаты/i.test(s)) return "Новый счёт";
+    if (/За 3 дня до оплаты/i.test(s) || /До оплаты [123] дн?\./i.test(s)) return "1–3 дня до оплаты";
+    if (/Просрочка 1 дн/i.test(s)) return "Просрочка 1 день";
+    if (/Просрочка >?7 дн/i.test(s)) return "Просрочка 7 дней";
+    if (/Просрочка (30|[3-9]\d+) дн/i.test(s)) return "Просрочка 30 дней";
+    return null;
+  }
+  const grouped = new Map();
+  const idxOverdue = header.indexOf(COLS.REGISTRY.OVERDUE);
+
+
+
+for (let i = 1; i < data.length; i++) {
+  // НЕ ПДЗ: пропускаем такие строки из рассылки
+  if (iReason !== -1 && _isNotPDZ_(data[i][iReason])) {
+    data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "НЕ ПДЗ";
+    continue;
+  }
+
+  const contrName = (data[i][idx[COLS.REGISTRY.CONTR]] || "").toString().trim();
+  const contrKey  = normalizeKA_(contrName);
+
+    // 0) стоп-лист RED (на случай, если строка вручную попала в Реестр)
+  if (redSet.has(contrKey)) {
+    data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: КА_RED";
+    continue;
+  }
+
+  // 1) без рассылки (КА остаётся в Реестре, но письма не шлём)
+  if (noPushSet.has(contrKey)) {
+    data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: KA_No push";
+    continue;
+  }
+
+  const stageText = data[i][idx[COLS.REGISTRY.STAGE]];
+  const daysDiff  = Number(data[i][idxOverdue]);
+  const bucket = mapStageToBucketByDays(daysDiff, stageText);
+
+  if (!contrName || !bucket) {
+    data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] =
+      !bucket ? "Пропущено: стадия не поддерживается" : "Пропущено: нет контрагента";
+    continue;
+  }
+  if (hasGreen && !greenSet.has(contrKey)) {
+    data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пока в стоп-листе";
+    continue;
+  }
+
+  const cols = stageCols[bucket];
+  const alreadyDate = toYmdFromCell_(data[i][cols.dateIdx]);
+
+
+
+ // 1. Проверка — нужно ли сегодня отправлять
+if (!shouldSendToday(bucket, daysDiff)) {
+  data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: не достигнут порог отправки";
+  continue;
+}
+
+// 2. Уже отправляли сегодня
+if (wasSentToday(alreadyDate, todayStr)) {
+  data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: письмо уже отправлено сегодня";
+  continue;
+}
+
+// 3. Проверка интервала повторной отправки
+if (!canRepeatSend(bucket, alreadyDate)) {
+  data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: рано для повторной отправки";
+  continue;
+}
+
+  const key = `${contrKey}|||${bucket}`;
+  if (!grouped.has(key)) grouped.set(key, []);
+  grouped.get(key).push(i);
+}
+
+  const remain = MailApp.getRemainingDailyQuota();
+  const groups = Array.from(grouped.keys());
+  if (!groups.length) {
+    sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+    return { emailGroupIndex: 0, done: true };
+  }
+
+  const startIndex = state?.emailGroupIndex || 0;
+  const sendCount = Math.min(BATCH_EMAIL_GROUPS, groups.length - startIndex, Math.max(0, remain));
+  if (sendCount <= 0) {
+    groups.slice(startIndex).forEach(k => (grouped.get(k)||[]).forEach(i => data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Отложено: лимит почты"));
+    sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+    return { emailGroupIndex: startIndex, done: false };
+  }
+
+  for (let g = 0; g < sendCount; g++) {
+    const key = groups[startIndex + g];
+    const [contrKey, bucket] = key.split("|||");
+    const rowIdxs = grouped.get(key) || [];
+    const emailInfo = mailMap.get(contrKey);
+    const nowSend = new Date();
+
+    if (!emailInfo || !emailInfo.client) {
+      const ts = Utilities.formatDate(nowSend, tz, `${DATE_FMT} HH:mm:ss`);
+      rowIdxs.forEach(i => { data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Пропущено: не найдена почта клиента"; data[i][idx[COLS.REGISTRY.LAST_SENT_AT]] = ts; });
+      continue;
+    }
+    const firstRowIdx = rowIdxs[0];
+    const contrName = (data[firstRowIdx][idx[COLS.REGISTRY.CONTR]] || "").toString().trim();
+    const subject = buildMailSubject_(bucket, contrName);
+
+
+
+     const intro =
+      bucket === "Новый счёт"
+     ? "Направляем в ваш адрес счета и напоминаем о необходимости их оплаты:"
+      : bucket === "1–3 дня до оплаты"
+      ? "Напоминаем о приближении срока оплаты по следующим счетам:"
+      : "По следующим счетам зафиксирована просрочка платежа:";
+
+
+    const html = buildInvoiceEmailHtml_({
+  rowIdxs,
+  data,
+  idx,
+  osChangedByRow,
+  intro
+});
+
+    try {
+      GmailApp.sendEmail(
+  emailInfo.client,
+  subject,
+  "Ваш почтовый клиент не поддерживает HTML-формат письма.",
+  {
+    cc: emailInfo.csm || "",
+    htmlBody: html
+  }
+);
+      const sentDate = Utilities.formatDate(nowSend, tz, DATE_FMT);
+      const sentTS   = Utilities.formatDate(nowSend, tz, `${DATE_FMT} HH:mm:ss`);
+      rowIdxs.forEach(i => {
+        const cols = stageCols[bucket];
+        const prev = Number(data[i][cols.countIdx] || 0);
+        data[i][cols.dateIdx] = sentDate;
+        data[i][cols.countIdx] = prev + 1;
+        data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = "Отправлено";
+        data[i][idx[COLS.REGISTRY.LAST_SENT_AT]]   = sentTS;
+      });
+    } catch (e) {
+      const errTS = Utilities.formatDate(nowSend, tz, `${DATE_FMT} HH:mm:ss`);
+      rowIdxs.forEach(i => { data[i][idx[COLS.REGISTRY.PROCESS_STATUS]] = `Ошибка отправки: ${e.message}`; data[i][idx[COLS.REGISTRY.LAST_SENT_AT]] = errTS; });
+    }
+  }
+
+  sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
+  const nextIndex = startIndex + sendCount;
+  return { emailGroupIndex: nextIndex, done: nextIndex >= groups.length };
+}
+
+/*********************************************************
+ * 6) ПОЛЯ ПДЗ + ВАЛИДАЦИИ
+ *********************************************************/
+function addPDZFieldsAndDropdown() {
+  const ss = getMainSpreadsheet_();
+  const sheet = ss.getSheetByName("Реестр");
+  const guideSheet = ss.getSheetByName("Справочник");
+
+  let header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const requiredCols = [COLS.REGISTRY.TYPE, "Причина ПДЗ"];
+  const existingCols = new Set(header);
+
+  requiredCols.forEach(name => {
+    if (!existingCols.has(name)) {
+      sheet.getRange(1, header.length + 1).setValue(name);
+      header = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    }
+  });
+
+  const reasonColIdx = header.indexOf("Причина ПДЗ") + 1;
+  if (reasonColIdx > 0 && guideSheet) {
+    const reasons = guideSheet.getRange("A2:A").getValues().flat().filter(r => r !== "");
+    const numRows = sheet.getLastRow() - 1;
+    if (reasons.length > 0 && numRows >= 1) {
+      const rule = SpreadsheetApp.newDataValidation().requireValueInList(reasons, true).setAllowInvalid(true).build();
+      sheet.getRange(2, reasonColIdx, numRows).setDataValidation(rule);
+    }
+  }
+}
+
+/*********************************************************
+ * 7) ЛИСТ "Ошибки"
+ *********************************************************/
+function createErrorSheet(missingRows, header) {
+  const ss = getMainSpreadsheet_();
+  let sheetErrors = ss.getSheetByName("Ошибки");
+  if (!sheetErrors) sheetErrors = ss.insertSheet("Ошибки");
+  else sheetErrors.clearContents();
+
+  if (missingRows.length === 0) { sheetErrors.getRange(1, 1).setValue("Нет ошибок — все проекты найдены в листе 'Договора'"); return; }
+
+    const errorHeader = [...header, "Комментарий ошибки"];
+  const errorRows = missingRows.map(row => [...row, "Корневой проект отсутствует в листе 'Договора'"]);
+  sheetErrors.getRange(1, 1, errorRows.length + 1, errorHeader.length).setValues([errorHeader, ...errorRows]);
+}
+
+/*********************************************************
+ * 8) ОТВЕТЫ И "НОВАЯ ДАТА ОПЛАТЫ"
+ * Эти поля удалены из "Реестр", поэтому функции оставлены только как
+ * безопасные заглушки для старых триггеров/кнопок.
+ *********************************************************/
+function updateRepliesStatus(state) {
+  Logger.log('updateRepliesStatus пропущена: колонки ответов удалены из "Реестр".');
+  return { repliesRow: 1 };
+}
+
+function addNewPaymentDate() {
+  Logger.log('addNewPaymentDate пропущена: служебные колонки ответов удалены из "Реестр".');
+}
+
+
+/*********************************************************
+ * 9b) СИНХРОНИЗАЦИЯ ИЗ ЛИСТА "Счета ОС" (ручные подтверждения)
+ * Если номер найден — обновляем "Срок оплаты" датой из ОС
+ * для перерасчёта стадий/просрочки.
+ *********************************************************/
+function applyOSInvoicesToRegistry() {
+  const ss = getMainSpreadsheet_();
+  const osSheet = ss.getSheetByName("Счета ОС");
+  const reestr  = ss.getSheetByName("Реестр");
+  if (!reestr) throw new Error('Лист "Реестр" не найден');
+  if (!osSheet) return; // если листа нет — тихо выходим
+
+  const osData = osSheet.getDataRange().getValues();
+  if (osData.length < 2) return;
+
+  const osHdr = (osData[0] || []).map(x => (x || "").toString().trim());
+  const iNumOS  = osHdr.indexOf("Номер");
+  const iDateOS = osHdr.indexOf("Новая дата");
+  const iCommOS = osHdr.indexOf("Комментарий"); // не обязателен
+  if (iNumOS === -1 || iDateOS === -1) throw new Error('В "Счета ОС" нужны колонки "Номер" и "Новая дата"');
+
+  // Собираем map: номер -> {dateYmd, comment}
+  const tz = getSpreadsheetTimeZone_();
+
+  const parseToYmd_ = (v) => {
+    if (!v) return null;
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+
+    const s = String(v).trim();
+    // dd.mm.yyyy
+    const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (m) {
+      const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+      if (!isNaN(d)) return Utilities.formatDate(d, tz, DATE_FMT);
+    }
+    // yyyy-mm-dd
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+    const d2 = new Date(s);
+    if (!isNaN(d2)) return Utilities.formatDate(d2, tz, DATE_FMT);
+    return null;
+  };
+
+  const osMap = new Map();
+  for (let r = 1; r < osData.length; r++) {
+    const num = (osData[r][iNumOS] || "").toString().trim();
+    if (!num) continue;
+
+    const ymd = parseToYmd_(osData[r][iDateOS]);
+    if (!ymd) continue;
+
+    const comm = iCommOS !== -1 ? (osData[r][iCommOS] || "").toString().trim() : "";
+    osMap.set(num, { ymd, comm });
+  }
+  if (osMap.size === 0) return;
+
+  // Реестр
+  let data = reestr.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  let header = (data[0] || []).map(x => (x || "").toString().trim());
+
+  const ensureCol = (name) => {
+    let col = header.indexOf(name);
+    if (col === -1) {
+      col = header.length;
+      header.push(name);
+      data[0] = header;
+      for (let i = 1; i < data.length; i++) data[i].push("");
+      reestr.getRange(1, col + 1).setValue(name);
+    }
+    return col;
+  };
+
+  const iNumR   = header.indexOf(COLS.REGISTRY.NUMBER); // "Номер"
+  const iDueR   = header.indexOf(COLS.REGISTRY.DUE);    // "Срок оплаты"
+  const iPayR   = header.indexOf(COLS.REGISTRY.PAY_STATUS);
+  if (iNumR === -1 || iDueR === -1 || iPayR === -1) {
+    throw new Error('В "Реестр" нужны колонки: "Номер", "Срок оплаты", "Оплата"');
+  }
+
+  const iType   = ensureCol(COLS.REGISTRY.TYPE);         // "Тип"
+  const iProc   = ensureCol(COLS.REGISTRY.PROCESS_STATUS);
+
+  // Обновляем батчем
+  const changed = [];
+  const changedSet = new Set();
+  const markChanged_ = (rowIndex) => {
+    if (changedSet.has(rowIndex)) return;
+    changedSet.add(rowIndex);
+    changed.push(rowIndex);
+  };
+
+  for (let r = 1; r < data.length; r++) {
+    if (_isPaid_(data[r][iPayR])) continue;
+
+    const num = (data[r][iNumR] || "").toString().trim();
+    if (!num) continue;
+
+    const hit = osMap.get(num);
+    if (!hit) continue;
+
+    // Пересчёт по "Срок оплаты" (чтобы стадия/просрочка считались от новой даты)
+    if (data[r][iDueR] !== hit.ymd) {
+      data[r][iDueR] = hit.ymd;
+      markChanged_(r);
+    }
+
+    // отметка в статус обработки (чтобы было видно источник)
+    data[r][iProc] = hit.comm ? `ОС: ${hit.comm}` : "ОС: подтверждена новая дата";
+    markChanged_(r);
+  }
+
+  if (changed.length) {
+    const width = header.length;
+    commitChangedRows_(reestr, data, changed, width);
+  }
+}
+
+
+/*********************************************************
+ * 10) PDZ Summary (31+ дней, только рассылались)
+ *********************************************************/
+const PDZ_DEFAULT_REPORT_EMAIL = "n.adianov@ventra.ru";
+const PDZ_SHEET_REESTR  = "Реестр";
+const PDZ_SHEET_HISTORY = "Метрики_история";
+
+const PDZ_fmt = {
+  money(n){ return Number(n||0).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2}); },
+  int(n){ return Number(n||0).toLocaleString('ru-RU'); },
+  date(d){ return Utilities.formatDate(d, getSpreadsheetTimeZone_(), DATE_FMT); }
+};
+
+function PDZ_loadAllOpenForPct_() {
+  const sh = getMainSpreadsheet_().getSheetByName(PDZ_SHEET_REESTR);
+  if (!sh) throw new Error('Лист "Реестр" не найден');
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return { sumAllOpen: 0, sumPDZAllOpen: 0 };
+
+  const h = data[0], col = n => h.indexOf(n);
+  const iStat   = col("Оплата");
+  const iSum    = col("Сумма");
+  const iOver   = col("Просрочка, дней");
+  const iReason = col("Причина ПДЗ");
+
+  if ([iStat, iSum, iOver].some(x => x === -1)) return { sumAllOpen: 0, sumPDZAllOpen: 0 };
+
+  let sumAllOpen = 0;
+  let sumPDZAllOpen = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const status = data[r][iStat];
+    if (_isPaid_(status)) continue;
+
+    // исключаем "НЕ ПДЗ"
+    if (iReason !== -1 && _isNotPDZ_(data[r][iReason])) continue;
+
+    const sum = toNumberRu_(data[r][iSum]) || 0;
+    const over = Number(data[r][iOver]);
+
+    sumAllOpen += sum;
+    if (Number.isFinite(over) && over > 0) sumPDZAllOpen += sum;
+  }
+
+  return { sumAllOpen, sumPDZAllOpen };
+}
+
+
+
+function PDZ_loadOpenInvoices_(){
+  const sh = getMainSpreadsheet_().getSheetByName(PDZ_SHEET_REESTR);
+  if (!sh) throw new Error('Лист "Реестр" не найден');
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) return {header:[], rows:[]};
+
+  const h=data[0], col=n=>h.indexOf(n);
+  const iContr=col("Контрагент");
+  const iNum  =col("Номер");
+  const iSum  =col("Сумма");
+  const iStat =col("Оплата");
+  const iDue  =col("Срок оплаты");
+  const iOver =col("Просрочка, дней");
+  const iLast =col("Время последней отправки");
+  const iReason = col("Причина ПДЗ");
+  const iStage  = col("Стадия");
+  const iComment= col("Комментарий");
+  const iProc   = col("Статус обработки");
+
+  if ([iContr,iNum,iSum,iStat,iDue,iOver,iLast].some(x=>x===-1))
+    throw new Error("Нужны колонки: Контрагент, Номер, Сумма, Оплата, Срок оплаты, Просрочка, дней, Время последней отправки");
+
+  const isJudicialText = (txt) => {
+    const s = (txt||"").toString().toLowerCase();
+    return /суд|иск|фссп|пристав|исполн|судеб/i.test(s);
+  };
+
+  const rows=[];
+  for (let r=1;r<data.length;r++){
+    if (iReason !== -1 && _isNotPDZ_(data[r][iReason])) continue; // ← ДОБАВЬ ЭТО
+    const status = data[r][iStat];
+    const overdue = Number(data[r][iOver]);
+    const lastSent= (data[r][iLast]||"").toString().trim();
+    if (_isPaid_(status)) continue;
+    if (!Number.isFinite(overdue) || overdue < 31) continue;
+    if (!lastSent) continue; // только те, где была рассылка
+
+    const judicial = isJudicialText(data[r][iReason]) || isJudicialText(data[r][iStage]) || isJudicialText(data[r][iComment]);
+    rows.push({
+      contr:(data[r][iContr]||"").toString().trim(),
+      num:(data[r][iNum]||"").toString().trim(),
+      sum: toNumberRu_(data[r][iSum]) || 0,
+      status:(data[r][iStat]||"").toString().trim(),
+      due:data[r][iDue]?new Date(data[r][iDue]):null,
+      overdue:overdue,
+      isJudicial: judicial
+    });
+  }
+  return {header:h, rows};
+}
+
+function PDZ_agingBucket_(d){ return (d!=null && d<=60) ? "31–60" : "60+"; }
+
+function PDZ_computeMetrics_(rows){
+  const today=new Date();
+  const m={
+    date:PDZ_fmt.date(today),
+    count:rows.length,
+    sum:rows.reduce((a,x)=>a+(x.sum||0),0),
+    sumPDZ:rows.reduce((a,x)=>a+(x.sum||0),0),
+    cntPDZ:rows.length,
+    avgOverdue:null, medOverdue:null,
+    aging:{"31–60":{sum:0,cnt:0},"60+":{sum:0,cnt:0}},
+    byClient:new Map(),
+    topSum:[]
+  };
+
+  const overVals = [];
+  rows.forEach(x=>{
+    if (x.overdue!=null && x.overdue>0) overVals.push(x.overdue);
+    const b = PDZ_agingBucket_(x.overdue); m.aging[b].sum+=x.sum; m.aging[b].cnt++;
+    const bc = m.byClient.get(x.contr) || {sum:0,cnt:0,preSum:0,preCnt:0,judSum:0,judCnt:0,maxOverdue:0};
+    bc.sum += x.sum; bc.cnt++;
+    if (x.isJudicial) { bc.judSum += x.sum; bc.judCnt++; } else { bc.preSum += x.sum; bc.preCnt++; }
+    bc.maxOverdue = Math.max(bc.maxOverdue, x.overdue||0);
+    m.byClient.set(x.contr, bc);
+  });
+
+  if (overVals.length){
+    m.avgOverdue = overVals.reduce((a,b)=>a+b,0)/overVals.length;
+    const sorted = overVals.slice().sort((a,b)=>a-b);
+    m.medOverdue = sorted[Math.floor(sorted.length/2)];
+  }
+  m.topSum = rows.slice().sort((a,b)=>b.sum-a.sum).slice(0,10);
+  return m;
+}
+
+function PDZ_writeHistory_(m){
+  const ss=getMainSpreadsheet_();
+  let sh=ss.getSheetByName(PDZ_SHEET_HISTORY);
+  if (!sh) sh=ss.insertSheet(PDZ_SHEET_HISTORY);
+  if (sh.getLastRow()===0){
+    sh.getRange(1,1,1,4).setValues([["Дата","Кол-во 31+","Сумма 31+","Сумма ПДЗ (31+)"]]);
+  }
+  const lastRow=sh.getLastRow();
+  const row=[m.date, m.count, m.sum, m.sumPDZ];
+  if (lastRow>1 && sh.getRange(lastRow,1).getValue()===m.date){
+    sh.getRange(lastRow,1,1,row.length).setValues([row]);
+  } else {
+    sh.getRange(lastRow+1,1,1,row.length).setValues([row]);
+  }
+  const vals = sh.getRange(2,1,sh.getLastRow()-1,4).getValues();
+  const map  = new Map(vals.map(v=>[v[0],v]));
+  const y = PDZ_fmt.date(new Date(Date.now()-24*3600*1000));
+  function delta(prevDateStr, curr){ const prev=map.get(prevDateStr); return prev? (curr - Number(prev[2])) : null; }
+  return { sum_d1: delta(y, m.sum) };
+}
+
+function PDZ_get7dDynamics_(){
+  const sh=getMainSpreadsheet_().getSheetByName(PDZ_SHEET_HISTORY);
+  if (!sh || sh.getLastRow()<2) return [];
+  const startRow = Math.max(2, sh.getLastRow()-7+1);
+  const vals = sh.getRange(startRow, 1, sh.getLastRow()-startRow+1, 4).getValues();
+  return vals.map(v=>({date:v[0], count:Number(v[1]||0), sum:Number(v[2]||0), pdz:Number(v[3]||0)}));
+}
+
+function PDZ_renderHtml_(m, deltas){
+  function kpi(label,val,sub){ return `<div style="padding:10px 14px;border:1px solid #eee;border-radius:10px;">
+    <div style="font-size:12px;color:#666">${label}</div>
+    <div style="font-size:18px;font-weight:700;margin-top:2px">${val}</div>
+    ${sub?`<div style="font-size:12px;color:#888;margin-top:4px">${sub}</div>`:""}</div>`; }
+  function table(headers,rows){
+    let html=`<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;margin:8px 0;width:100%"><tr style="background:#f5f5f5">`;
+    headers.forEach(h=> html+=`<th style="text-align:left">${h}</th>`); html+=`</tr>`;
+    rows.forEach(r=>{ html+="<tr>"+r.map((c,i)=>`<td style="${i>0?'text-align:right':''}">${c}</td>`).join("")+"</tr>"; });
+    return html+"</table>";
+  }
+
+  const pctAll = PDZ_loadAllOpenForPct_();
+  const pdzPct = pctAll.sumAllOpen>0 ? Math.round(100 * pctAll.sumPDZAllOpen / pctAll.sumAllOpen) : 0;
+
+  const kpis = `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px">
+    ${kpi("Проблемные 31+ дн., ₽", PDZ_fmt.money(m.sum), deltas?.sum_d1!=null?`к вчера: ${(deltas.sum_d1>=0?"+":"")}${PDZ_fmt.money(deltas.sum_d1)}`:"")}
+    ${kpi("Кол-во счетов (31+)", PDZ_fmt.int(m.count))}
+    ${kpi("% ПДЗ по всем открытым", `${pdzPct}%`, "основа: все не «Оплачен»")}
+    ${kpi("Средняя просрочка (31+), дн.", m.avgOverdue!=null?PDZ_fmt.int(m.avgOverdue.toFixed(0)):"—", m.medOverdue!=null?`медиана: ${m.medOverdue}`:"")}
+  </div>`;
+
+  const agingRows=[["31–60",m.aging["31–60"].cnt,PDZ_fmt.money(m.aging["31–60"].sum)],
+                   ["60+",  m.aging["60+"].cnt,   PDZ_fmt.money(m.aging["60+"].sum)]];
+  const aging = table(["Эйджинг (дни)","Кол-во","Сумма, ₽"], agingRows);
+
+  const clients = Array.from(m.byClient.entries())
+    .map(([c,v])=>({c,sum:v.sum,cnt:v.cnt,preSum:v.preSum,judSum:v.judSum,maxOverdue:v.maxOverdue}))
+    .sort((a,b)=>b.sum-a.sum);
+  const clientsTbl = table(
+    ["Клиент","Кол-во","Сумма, ₽","Досудебная, ₽","Судебная, ₽","Макс. проср., дн."],
+    clients.map(x=>[x.c, x.cnt, PDZ_fmt.money(x.sum), PDZ_fmt.money(x.preSum), PDZ_fmt.money(x.judSum), x.maxOverdue||0])
+  );
+
+  const topSumTbl = table(["Счёт","Клиент","Сумма, ₽","Проср., дн."],
+    m.topSum.map(x=>[x.num,x.contr,PDZ_fmt.money(x.sum),x.overdue||0])
+  );
+
+  const dyn = PDZ_get7dDynamics_();
+  const dynTbl = dyn.length ? table(["Дата","Кол-во (31+)","Сумма проблемных (31+), ₽","Сумма ПДЗ, ₽"],
+    dyn.map(r=>[r.date, r.count, PDZ_fmt.money(r.sum), PDZ_fmt.money(r.pdz)]) ) : "";
+
+  return `<div style="font-family:system-ui,Segoe UI,Roboto,sans-serif;font-size:14px;">
+    <h2 style="margin:0 0 8px 0">Проблемные счета 31+ дней • ${m.date}</h2>
+    ${kpis}
+    <h3 style="margin:14px 0 6px 0">Эйджинг (31–60 / 60+)</h3>${aging}
+    <h3 style="margin:14px 0 6px 0">По клиентам (ранж. по сумме)</h3>${clientsTbl}
+    <h3 style="margin:14px 0 6px 0">Топ счетов по сумме</h3>${topSumTbl}
+    ${dynTbl ? `<h3 style="margin:14px 0 6px 0">Динамика за последние 7 дней</h3>${dynTbl}` : ""}
+    <p style="color:#888;margin-top:10px">В отчет попадают ТОЛЬКО не оплаченные/частично оплаченные счета с просрочкой ≥31 дня, по которым ранее была отправлена рассылка.</p>
+  </div>`;
+}
+
+function sendPDZSummaryEmail(toEmail) {
+  const recipient = (toEmail || PDZ_DEFAULT_REPORT_EMAIL || "").trim();
+  if (!recipient) throw new Error("Не указан адрес получателя отчета");
+
+  const { rows } = PDZ_loadOpenInvoices_();
+  const m = PDZ_computeMetrics_(rows);
+  const deltas = PDZ_writeHistory_(m);
+  const html = PDZ_renderHtml_(m, deltas);
+
+  const csvHeader = ["Контрагент","Номер","Сумма","Статус","Срок оплаты","Просрочка, дней","Судебный признак"];
+  const csvBody = rows.map(r=>[
+    r.contr, r.num, String(r.sum).replace(".", ","), r.status,
+    r.due ? Utilities.formatDate(r.due, getSpreadsheetTimeZone_(), DATE_FMT) : "",
+    r.overdue || 0,
+    r.isJudicial ? "судебная/ФССП" : "досудебная"
+  ]);
+  const csv = [csvHeader].concat(csvBody).map(a=>a.join(";")).join("\n");
+  const blob = Utilities.newBlob(csv, "text/csv", `pdz_31plus_${Utilities.formatDate(new Date(), getSpreadsheetTimeZone_(), "yyyyMMdd")}.csv`);
+
+  const subject = `PDZ 31+ • сводка — ${Utilities.formatDate(new Date(), getSpreadsheetTimeZone_(), DATE_FMT)}`;
+  GmailApp.sendEmail(
+  recipient,
+  subject,
+  "Ваш почтовый клиент не поддерживает HTML-формат письма.",
+  {
+    htmlBody: html,
+    attachments: [blob]
+  }
+);
+
+  getMainSpreadsheet_().toast("Сводный PDZ-отчет отправлен: " + recipient, "Готово", 5);
+}
+
+function sendPDZSummaryEmailPrompt_() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt("Куда отправить сводку PDZ 31+?", ui.ButtonSet.OK_CANCEL);
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+  const email = (resp.getResponseText() || "").trim();
+  if (!email) {
+    ui.alert("Адрес пустой. Отмена.");
+    return;
+  }
+  sendPDZSummaryEmail(email);
+}
+
+
+
+/*********************************************************
+ * 12) ГЛАВНЫЙ ПАЙПЛАЙН (всегда полный запуск)
+ * — без фоновых триггеров и без раннего выхода
+ *********************************************************/
+function mainUpdatePipeline() {
+  return withLock_(() => {
+    const started = Date.now();
+    const tz = getSpreadsheetTimeZone_();
+    Logger.log("=== mainUpdatePipeline TICK @ " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss") + " ===");
+
+    const state = getState_();
+    Logger.log(
+      "phase=" + (state.phase || "import") +
+      " | paylogRow=" + (state.paylogRow || 1) +
+      " | stagesRow=" + (state.stagesRow || 1) +
+      " | emailGroupIndex=" + (state.emailGroupIndex || 0)
+    );
+
+    try {
+      // 1) импорт
+      if (state.phase === "import" || !state.phase) {
+        importLastExportFromMail();
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "due" }); return; }
+        state.phase = "due";
+      }
+
+      // 2) сроки + реестр
+      if (state.phase === "due") {
+        updateDueDatesAndRegistry();
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "os_sync" }); return; }
+        state.phase = "os_sync";
+      }
+
+      // 2b) синхронизация ОС до расчета статусов и стадий
+      if (state.phase === "os_sync") {
+        applyOSInvoicesToRegistry();
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "paylog", paylogRow: 1 }); return; }
+        state.phase = "paylog";
+        state.paylogRow = state.paylogRow || 1;
+      }
+
+      // 3) лог оплат батчами
+      if (state.phase === "paylog") {
+        const res = updatePaymentStatusLog({ paylogRow: state.paylogRow || 1 });
+        if (res && res.paylogRow !== 1) { setState_({ phase: "paylog", paylogRow: res.paylogRow }); return; }
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "stages", stagesRow: 1 }); return; }
+        state.phase = "stages";
+        state.stagesRow = state.stagesRow || 1;
+      }
+
+      // 4) стадии/просрочки батчами
+      if (state.phase === "stages") {
+        const res = updateStagesAndOverdueDays({ stagesRow: state.stagesRow || 1 });
+        if (res && res.stagesRow !== 1) { setState_({ phase: "stages", stagesRow: res.stagesRow }); return; }
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "emails", emailGroupIndex: 0 }); return; }
+        state.phase = "emails";
+        state.emailGroupIndex = state.emailGroupIndex || 0;
+      }
+
+      // 5) рассылка
+      if (state.phase === "emails") {
+        const res = sendStageEmails({ emailGroupIndex: state.emailGroupIndex || 0 });
+        if (res && !res.done) { setState_({ phase: "emails", emailGroupIndex: res.emailGroupIndex || 0 }); return; }
+        if (Date.now() - started > WATCHDOG_MS) { setState_({ phase: "pdz_fields" }); return; }
+        state.phase = "pdz_fields";
+      }
+
+      // 6) поля/валидации ПДЗ
+      if (state.phase === "pdz_fields") {
+        addPDZFieldsAndDropdown();
+      }
+
+      // финал
+      setState_({});
+      Logger.log("=== mainUpdatePipeline DONE (full cycle) ===");
+
+    } catch (e) {
+      Logger.log("ОШИБКА mainUpdatePipeline: " + e.message + "\n" + (e.stack || ""));
+      throw e;
+    }
+  });
+}
+
+function buildPDZClientStats() {
+  const SRC_SHEET = "Реестр";
+  const DEST_SHEET = "PDZ_клиенты";
+
+  const ss = getMainSpreadsheet_();
+  const src = ss.getSheetByName(SRC_SHEET);
+  if (!src) throw new Error('Лист "Реестр" не найден');
+
+  const data = src.getDataRange().getValues();
+  if (data.length < 2) {
+    let dest = ss.getSheetByName(DEST_SHEET);
+    if (!dest) dest = ss.insertSheet(DEST_SHEET);
+    dest.clearContents().clearFormats();
+    dest.getRange(1, 1).setValue("Нет данных по ПДЗ (строк < 2)");
+    return;
+  }
+
+  const header = data[0];
+  const col = function (name) { return header.indexOf(name); };
+
+  const iContr  = col("Контрагент");
+  const iSum    = col("Сумма");
+  const iOver   = col("Просрочка, дней");
+  const iType   = col("Тип");
+  const iPay    = col("Оплата");
+  const iReason = col("Причина ПДЗ");
+
+  if (iContr === -1 || iSum === -1 || iOver === -1 || iType === -1 || iPay === -1) {
+    throw new Error('Нужны колонки: "Контрагент", "Сумма", "Просрочка, дней", "Тип", "Оплата" (и желательно "Причина ПДЗ")');
+  }
+
+  var agg = new Map(); // contr -> { sum, count, overSum }
+
+  for (var r = 1; r < data.length; r++) {
+    var status = data[r][iPay];
+    if (_isPaid_(status)) continue;
+
+
+    var type = (data[r][iType] || "").toString().trim();
+    if (!type.startsWith("ПДЗ")) continue;
+
+    var overdue = Number(data[r][iOver]);
+    if (!Number.isFinite(overdue) || overdue <= 0) continue;
+
+    if (iReason !== -1 && _isNotPDZ_(data[r][iReason])) continue;
+
+    var contr = (data[r][iContr] || "").toString().trim();
+    if (!contr) continue;
+
+    var sum = toNumberRu_(data[r][iSum]) || 0;
+    if (!agg.has(contr)) {
+      agg.set(contr, { sum: 0, count: 0, overSum: 0 });
+    }
+    var a = agg.get(contr);
+    a.sum += sum;
+    a.count += 1;
+    a.overSum += overdue;
+  }
+
+  var dest = ss.getSheetByName(DEST_SHEET);
+  if (!dest) dest = ss.insertSheet(DEST_SHEET);
+  dest.clearContents().clearFormats();
+
+  var headerOut = [
+    "Контрагент",
+    "Средняя просрочка, дней",
+    "Сумма счетов, ₽",
+    "Кол-во счетов"
+  ];
+
+  var rows = [];
+  agg.forEach(function (v, contr) {
+    if (v.count === 0) return;
+    var avgOverdue = v.overSum / v.count;
+    var sum = v.sum;
+
+    // выводим только если выполняется одно из условий
+    var cond1 = avgOverdue > 3 && sum > 1000000;
+    var cond2 = avgOverdue > 7 && sum > 3000000;
+    if (!cond1 && !cond2) return;
+
+    rows.push([
+      contr,
+      avgOverdue,
+      sum,
+      v.count
+    ]);
+  });
+
+  if (rows.length === 0) {
+    dest.getRange(1, 1, 1, headerOut.length).setValues([headerOut]);
+    dest.getRange(2, 1).setValue("Нет контрагентов, удовлетворяющих критериям ПДЗ");
+    return;
+  }
+
+  // сортируем по сумме по убыванию
+  rows.sort(function (a, b) { return b[2] - a[2]; });
+
+  var out = [headerOut].concat(rows);
+  dest.getRange(1, 1, out.length, headerOut.length).setValues(out);
+
+  var lastRow = out.length;
+  dest.getRange(2, 2, lastRow - 1, 1).setNumberFormat("0.0");
+  dest.getRange(2, 3, lastRow - 1, 1).setNumberFormat("#,##0.00");
+  dest.getRange(2, 4, lastRow - 1, 1).setNumberFormat("0");
+
+  var rules = [];
+  var dataRange = dest.getRange(2, 1, lastRow - 1, headerOut.length);
+
+  // жёлтый: >3 дней и >1 млн
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($B2>3,$C2>1000000)')
+      .setBackground('#fff2cc')
+      .setRanges([dataRange])
+      .build()
+  );
+
+  // красный: >7 дней и >3 млн
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied('=AND($B2>7,$C2>3000000)')
+      .setBackground('#f4c7c3')
+      .setRanges([dataRange])
+      .build()
+  );
+
+  dest.setConditionalFormatRules(rules);
+}
+
+function buildProblemRegistry29d() {
+  const SRC_SHEET = "Реестр";
+  const DEST_SHEET = "Проблемные_29+";
+
+  const ss = getMainSpreadsheet_();
+  const src = ss.getSheetByName(SRC_SHEET);
+  if (!src) throw new Error('Лист "Реестр" не найден');
+
+  const data = src.getDataRange().getValues();
+  let dest = ss.getSheetByName(DEST_SHEET);
+  if (!dest) dest = ss.insertSheet(DEST_SHEET);
+  dest.clearContents().clearFormats();
+
+  const outHeader = [
+    "Контрагент",
+    "Номер",
+    "Сумма",
+    "Срок оплаты",
+    "Просрочка, дней",
+    "Тип",
+    "Ответственный",
+    "Причина ПДЗ",
+    "Комментарий"
+  ];
+
+  if (data.length < 2) {
+    dest.getRange(1, 1, 1, outHeader.length).setValues([outHeader]);
+    dest.getRange(2, 1).setValue("Нет данных");
+    return;
+  }
+
+  const header = data[0].map(x => (x || "").toString().trim());
+  const col = (name) => header.indexOf(name);
+
+  const iContr  = col(COLS.REGISTRY.CONTR);
+  const iNum    = col(COLS.REGISTRY.NUMBER);
+  const iSum    = col(COLS.REGISTRY.SUM);
+  const iPay    = col(COLS.REGISTRY.PAY_STATUS);
+  const iDue    = col(COLS.REGISTRY.DUE);
+  const iOver   = col(COLS.REGISTRY.OVERDUE);
+  const iType   = col(COLS.REGISTRY.TYPE);
+  const iOwner  = col(COLS.REGISTRY.OWNER);
+  const iReason = col("Причина ПДЗ");
+  const iComm   = col(COLS.REGISTRY.COMMENT);
+
+  if ([iContr, iNum, iSum, iPay, iDue, iOver].some(x => x === -1)) {
+    throw new Error('Нужны колонки: "Контрагент", "Номер", "Сумма", "Оплата", "Срок оплаты", "Просрочка, дней"');
+  }
+
+  const rows = [];
+  for (let r = 1; r < data.length; r++) {
+    if (_isPaid_(data[r][iPay])) continue;
+    if (iReason !== -1 && _isNotPDZ_(data[r][iReason])) continue;
+
+    const overdue = Number(data[r][iOver]);
+    if (!Number.isFinite(overdue) || overdue < 29) continue;
+
+    rows.push([
+      data[r][iContr],
+      data[r][iNum],
+      toNumberRu_(data[r][iSum]) || 0,
+      data[r][iDue],
+      overdue,
+      iType !== -1 ? data[r][iType] : "",
+      iOwner !== -1 ? data[r][iOwner] : "",
+      iReason !== -1 ? data[r][iReason] : "",
+      iComm !== -1 ? data[r][iComm] : ""
+    ]);
+  }
+
+  rows.sort((a, b) => Number(b[4] || 0) - Number(a[4] || 0) || Number(b[2] || 0) - Number(a[2] || 0));
+
+  dest.getRange(1, 1, 1, outHeader.length).setValues([outHeader]);
+  if (!rows.length) {
+    dest.getRange(2, 1).setValue("Нет неоплаченных счетов с просрочкой 29+ дней");
+    return;
+  }
+
+  dest.getRange(2, 1, rows.length, outHeader.length).setValues(rows);
+  dest.getRange(2, 3, rows.length, 1).setNumberFormat("#,##0.00");
+  dest.getRange(2, 5, rows.length, 1).setNumberFormat("0");
+  dest.setFrozenRows(1);
+  dest.autoResizeColumns(1, outHeader.length);
+}
+
+
+/*********************************************************
+ * SERVICE: очистка внешнего листа "Выгрузка" по "Дата обновления"
+ *********************************************************/
+function purgeVygruzkaBeforeDate_() {
+  const DATE_COL   = "Дата обновления";
+  const DATE_FMT_UI = "dd.MM.yyyy";
+
+  const sh = getImportSheet_();
+
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.prompt(
+    `Очистка «${PDZ_IMPORT_SHEET_NAME}»`,
+    `Укажи дату, начиная с которой строки ОСТАВИТЬ (формат ${DATE_FMT_UI}).\nНапр.: 01.12.2025`,
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const s = (resp.getResponseText() || "").trim();
+  const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (!m) { ui.alert("Неверный формат даты. Нужно: dd.MM.yyyy"); return; }
+
+  const cut = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  if (isNaN(cut)) { ui.alert("Дата не распознана"); return; }
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) { ui.alert("На листе нет данных (кроме заголовка)"); return; }
+
+  const data = sh.getRange(1, 1, lastRow, lastCol).getValues();
+  const header = data[0].map(x => (x || "").toString().trim());
+  const idx = header.indexOf(DATE_COL);
+  if (idx === -1) throw new Error(`В "${PDZ_IMPORT_SHEET_NAME}" нет колонки "${DATE_COL}"`);
+
+  const tz = getSpreadsheetTimeZone_();
+
+  const toYmd = (v) => {
+    if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, tz, DATE_FMT);
+    if (typeof v === "string") {
+      const t = v.trim();
+      // поддержка yyyy-mm-dd
+      if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+      // поддержка dd.mm.yyyy
+      const mm = t.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+      if (mm) return `${mm[3]}-${mm[2]}-${mm[1]}`;
+    }
+    return null;
+  };
+
+  const cutYmd = Utilities.formatDate(cut, tz, DATE_FMT);
+
+  // оставляем строки где дата обновления >= cutYmd
+  const kept = [data[0]];
+  let removed = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const ymd = toYmd(data[r][idx]);
+    if (!ymd) { kept.push(data[r]); continue; }           // если дата не парсится — НЕ удаляем
+    if (ymd >= cutYmd) kept.push(data[r]);
+    else removed++;
+  }
+
+  sh.clearContents();
+  sh.getRange(1, 1, kept.length, kept[0].length).setValues(kept);
+
+  ui.alert("Готово. Удалено строк: " + removed + ". Осталось (с заголовком): " + kept.length + ".");
+
+  
+}
+
+/*********************************
+ * TEST: отправка тестового письма (1 письмо, 2 строки)
+ * Кому: n.adianov@ventra.ru
+ *********************************/
+function testSendInvoiceEmail() {
+  const TO = "n.adianov@ventra.ru";
+  const tz = getSpreadsheetTimeZone_();
+
+  const subject = `TEST • ${buildMailSubject_("Новый счёт", "Тестовый контрагент")} (${Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm:ss")})`;
+  const intro = "Информируем, что в адрес вашей компании выставлены следующие счета (тест):";
+
+  const fakeData = [
+    [],
+    ["12345", "Тестовый контрагент", 220000.00, "15.12.2025", "16.12.2025", "20.12.2025", "Тестовый комментарий"],
+    ["67890", "Тестовый контрагент", 50324.45, "14.12.2025", "15.12.2025", "18.12.2025", ""]
+  ];
+
+  const fakeIdx = {};
+  fakeIdx[COLS.REGISTRY.NUMBER]  = 0;
+  fakeIdx[COLS.REGISTRY.CONTR]   = 1;
+  fakeIdx[COLS.REGISTRY.SUM]     = 2;
+  fakeIdx[COLS.REGISTRY.DATE]    = 3;
+  fakeIdx[COLS.REGISTRY.FACT_INV_DATE] = 4;
+  fakeIdx[COLS.REGISTRY.DUE]     = 5;
+  fakeIdx[COLS.REGISTRY.COMMENT] = 6;
+
+  const rowIdxs = [1, 2];
+  const osChangedByRow = new Map();
+
+  const html = buildInvoiceEmailHtml_({
+    rowIdxs,
+    data: fakeData,
+    idx: fakeIdx,
+    osChangedByRow,
+    intro
+  });
+
+  GmailApp.sendEmail(
+    TO,
+    subject,
+    "Ваш почтовый клиент не поддерживает HTML-формат письма.",
+    {
+      htmlBody: html
+    }
+  );
+
+  getMainSpreadsheet_().toast("Тестовое письмо отправлено на " + TO, "Готово", 5);
+}
+
+
+/*********************************
+ * GO Контроль — Оперметрики PRO (Ventra GO)
+ * Полная версия с логотипом, событиями периода и улучшенной аналитикой
+ *********************************/
+
+/** ===== НАСТРОЙКИ ===== */
+const CFG = {
+  OPS_EMAIL_TO: "n.adianov@ventra.ru,i.dautov@ventra.ru",
+
+  SHEETS: {
+    REESTR: "Реестр",
+    ERR: "Ошибки",
+    VYGRUZKA: PDZ_IMPORT_SHEET_NAME,
+  },
+
+  COLORS: {
+    PRIMARY: "#7826D4",
+    PRIMARY_DARK: "#5E1DA8",
+    ACCENT: "#FF3E52",
+    BG: "#F4F5F8",
+    TEXT: "#333333",
+    WHITE: "#FFFFFF",
+    SUCCESS: "#27AE60",
+    WARNING: "#F59E0B",
+    BORDER: "#E8EAF0",
+    MUTED: "#7C8594",
+    LIGHT_PURPLE: "#F5EEFF",
+    LIGHT_RED: "#FFF1F3",
+    LIGHT_GREEN: "#EDF8F1",
+    LIGHT_YELLOW: "#FFF8E8",
+  },
+
+  TS_FMT: "yyyy-MM-dd HH:mm:ss",
+  MISSING_EMAIL_STATUS_TARGET: "пропущено: не найдена почта клиента",
+
+  BUCKETS: [
+    "Новый счёт",
+    "1–3 дня до оплаты",
+    "Просрочка 1 день",
+    "Просрочка 7 дней",
+    "Просрочка 30 дней",
+  ],
+
+  LIMITS: {
+    CLIENT_ROWS: 200,
+    PAY_ROWS: 200,
+    INLINE_ERR_ROWS: 80,
+    ERR_REASON_ROWS: 80,
+    ERR_CLIENT_ROWS: 120,
+    MISSING_EMAIL_ROWS: 120,
+    CELL_TEXT: 220,
+  },
+
+  LOGO_URL: "https://drive.google.com/uc?export=view&id=1u3hQfFcsPX8wAWXC1ylZRorm5Et3hgUt",
+};
+
+/** ===== КНОПКИ / ВРАППЕРЫ ===== */
+function sendOpsMetricsEmail24() { return sendOpsMetricsEmail_(24, CFG.OPS_EMAIL_TO); }
+function sendOpsMetricsEmail48() { return sendOpsMetricsEmail_(48, CFG.OPS_EMAIL_TO); }
+
+/** ===== ОСНОВНАЯ ФУНКЦИЯ ===== */
+function sendOpsMetricsEmail_(hours = 24, to = CFG.OPS_EMAIL_TO) {
+  const ss = getMainSpreadsheet_();
+  const tz = ss.getSpreadsheetTimeZone();
+  const now = new Date();
+  const from = new Date(now.getTime() - hours * 3600 * 1000);
+
+  const reestr = readSheet_(ss, CFG.SHEETS.REESTR);
+  if (!reestr.ok) throw new Error(`Лист "${CFG.SHEETS.REESTR}" не найден`);
+
+  const tech = {
+    registryTotalRows: Math.max(0, reestr.values.length - 1),
+    vygruzkaTotalRows: null,
+  };
+
+  const vy = getImportSheet_();
+  if (vy) tech.vygruzkaTotalRows = Math.max(0, vy.getLastRow() - 1);
+
+  const H = headerIndex_(reestr.values[0]);
+
+  const iContr      = col_(H, "Контрагент");
+  const iProc       = col_(H, "Статус обработки");
+  const iLast       = col_(H, "Время последней отправки");
+  const iInvoice    = firstOf_(H, ["Номер", "Номер счета", "№ счета", "Invoice", "Счет"]);
+  const iInvDate    = firstOf_(H, ["Дата", "Дата счета", "Дата документа", "Invoice date"]);
+  const iSum        = firstOf_(H, ["Сумма", "Сумма счета", "Итого"]);
+  const iComment    = firstOf_(H, ["Комментарий", "Комментарий оплаты", "Примечание"]);
+  const iPayStatus  = firstOf_(H, ["Оплата", "Статус оплаты", "Стадия"]);
+  const iPayTs      = firstOf_(H, ["Дата оплаты", "Фактическая дата оплаты"]);
+  const iDue        = firstOf_(H, ["Срок оплаты"]);
+  const iOverdue    = firstOf_(H, ["Просрочка, дней"]);
+  const iType       = firstOf_(H, ["Тип"]);
+
+  if ([iContr, iProc, iLast].some(i => i === -1)) {
+    if (reestr.values.length > 1) {
+      throw new Error("Нет колонок: Контрагент / Статус обработки / Время последней отправки");
+    }
+  }
+
+  const bucketCols = {};
+  CFG.BUCKETS.forEach(b => bucketCols[b] = col_(H, "Письмо: " + b));
+
+  const agg = {
+    windowMatched: 0,
+    sent: 0,
+    uniqueClients: new Set(),
+    uniqueInvoices: new Set(),
+    quotaDeferred: 0,
+    manualPushes: 0,
+
+    errorsInline: [],
+    byBucket: Object.fromEntries(CFG.BUCKETS.map(b => [b, 0])),
+
+    events: {
+      newInvoices: 0,
+      dueSoon: 0,
+      overdue1: 0,
+      overdue7: 0,
+      overdue30: 0,
+    },
+
+    clientsMap: new Map(),
+    missingEmailItems: [],
+    byType: new Map(),
+    byProcStatus: new Map(),
+  };
+
+  const paymentsToday = buildPaymentsToday_(reestr.values, {
+    tz, now, iPayStatus, iPayTs, iProc, iComment, iInvoice, iInvDate, iContr, iSum, limits: CFG.LIMITS,
+  });
+
+  for (let r = 1; r < reestr.values.length; r++) {
+    const row = reestr.values[r];
+    const ts = parseTS_(row[iLast]);
+    if (!ts || ts < from || ts > now) continue;
+
+    agg.windowMatched++;
+
+    const clientName = str_(row[iContr]);
+    const invoice = iInvoice !== -1 ? str_(row[iInvoice]) : "";
+    const statusRaw = str_(row[iProc]);
+    const statusNorm = statusRaw.replace(/\s+/g, " ").trim().toLowerCase();
+
+    incMap_(agg.byProcStatus, statusRaw || "(пусто)");
+    if (iType !== -1) incMap_(agg.byType, str_(row[iType]) || "(пусто)");
+
+    const isSent = /отправлено/i.test(statusRaw);
+    const isManualPush = /ручн/i.test(statusRaw);
+
+    if (isSent) {
+      agg.sent++;
+      agg.uniqueClients.add(clientName || "(без названия)");
+      if (invoice) agg.uniqueInvoices.add(invoice);
+
+      if (isManualPush) agg.manualPushes++;
+
+      const dayStr = Utilities.formatDate(ts, tz, "yyyy-MM-dd");
+      let matchedBucket = null;
+
+      for (const b of CFG.BUCKETS) {
+        const cIdx = bucketCols[b];
+        if (cIdx !== -1 && dayOnly_(row[cIdx], tz) === dayStr) {
+          matchedBucket = b;
+          break;
+        }
+      }
+
+      if (matchedBucket) {
+        agg.byBucket[matchedBucket] += 1;
+
+        if (matchedBucket === "Новый счёт") agg.events.newInvoices++;
+        if (matchedBucket === "1–3 дня до оплаты") agg.events.dueSoon++;
+        if (matchedBucket === "Просрочка 1 день") agg.events.overdue1++;
+        if (matchedBucket === "Просрочка 7 дней") agg.events.overdue7++;
+        if (matchedBucket === "Просрочка 30 дней") agg.events.overdue30++;
+      }
+
+      accClient_(agg.clientsMap, clientName, matchedBucket, invoice);
+    }
+
+    if (/отложено/i.test(statusRaw) && /лимит/i.test(statusRaw)) {
+      agg.quotaDeferred++;
+    }
+
+    if (/ошибка/i.test(statusRaw)) {
+      agg.errorsInline.push({
+        client: clientName || "—",
+        status: statusRaw,
+        ts: Utilities.formatDate(ts, tz, CFG.TS_FMT),
+      });
+    }
+
+    if (statusNorm === CFG.MISSING_EMAIL_STATUS_TARGET) {
+      agg.missingEmailItems.push({
+        client: clientName || "—",
+        ts,
+        invoice: invoice || "",
+      });
+    }
+  }
+
+  const clientsRows = buildClientsRows_(agg.clientsMap, {
+    buckets: CFG.BUCKETS,
+    useInvoiceSet: (iInvoice !== -1),
+  });
+
+  const inlineErrRows = buildInlineErrorsRows_(agg.errorsInline, CFG.LIMITS);
+  const missingEmailsBlock = buildMissingEmailsBlock_(agg.missingEmailItems, {
+    tz,
+    useInvoiceSet: (iInvoice !== -1),
+    limits: CFG.LIMITS,
+  });
+
+  const errSheetBlock = buildErrSheetBlock_(ss, {
+    sheetName: CFG.SHEETS.ERR,
+    from,
+    now,
+    tz,
+    limits: CFG.LIMITS,
+  });
+
+  const overdueBlock = buildOverdueAnalytics_(reestr.values, {
+    from, now, tz, iLast, iOverdue, iContr, iSum, iInvoice, iType,
+  });
+
+  const clientsLR = limitRows_(clientsRows, CFG.LIMITS.CLIENT_ROWS);
+  const payLR = limitRows_(paymentsToday.rows, CFG.LIMITS.PAY_ROWS);
+  paymentsToday.rows = payLR.cut;
+  paymentsToday.hidden = payLR.hidden;
+
+  const model = {
+    tz,
+    now,
+    from,
+    hours,
+    tech,
+
+    kpi: {
+      sent: agg.sent,
+      unique: agg.uniqueClients.size,
+      uniqueInvoices: agg.uniqueInvoices.size,
+      quotaDeferred: agg.quotaDeferred,
+      totalErrors: agg.errorsInline.length,
+      windowMatched: agg.windowMatched,
+      manualPushes: agg.manualPushes,
+    },
+
+    events: agg.events,
+    buckets: CFG.BUCKETS,
+    byBucket: agg.byBucket,
+    overdueBlock,
+    typeRows: mapToSortedRows_(agg.byType, 10),
+    procStatusRows: mapToSortedRows_(agg.byProcStatus, 12),
+
+    clients: {
+      headers: ["Клиент", "Счета (шт)", "Всего", ...CFG.BUCKETS],
+      rows: clientsLR.cut,
+      hidden: clientsLR.hidden,
+      useInvoiceSet: (iInvoice !== -1),
+    },
+
+    inlineErrors: {
+      rows: inlineErrRows.cut,
+      hidden: inlineErrRows.hidden,
+    },
+
+    errSheet: errSheetBlock,
+    missingEmails: missingEmailsBlock,
+    paymentsToday,
+  };
+
+  MailApp.sendEmail({
+    to,
+    subject: `GO: Оперметрики PRO (${hours}ч) — ${Utilities.formatDate(now, tz, "dd.MM")}`,
+    htmlBody: htmlReportVentra_(model),
+  });
+}
+
+/** ===== ВИЗУАЛИЗАЦИЯ ===== */
+function htmlReportVentra_(m) {
+  const tz = m.tz;
+  const nowStr = Utilities.formatDate(new Date(), tz, "dd.MM.yyyy HH:mm");
+  const periodStr = `за последние ${m.hours}ч`;
+  const C = CFG.COLORS;
+
+  const css = `
+    <style>
+      body { margin:0; padding:0; background:${C.BG}; font-family:Arial,Helvetica,sans-serif; color:${C.TEXT}; }
+      .wrap { width:100%; background:${C.BG}; padding:20px 0; }
+      .container { max-width:760px; margin:0 auto; background:#fff; border-radius:16px; overflow:hidden; box-shadow:0 8px 30px rgba(0,0,0,0.06); }
+      .header { background:linear-gradient(135deg, ${C.PRIMARY} 0%, ${C.PRIMARY_DARK} 100%); color:#fff; padding:28px 24px 22px 24px; }
+      .logo { margin-bottom:16px; }
+      .logo img { max-width:140px; height:auto; display:block; }
+      .title { font-size:26px; font-weight:700; margin:0; letter-spacing:0.2px; }
+      .subtitle { margin-top:8px; font-size:13px; opacity:0.92; }
+
+      .kpi-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; padding:18px; background:#FAFBFD; border-bottom:1px solid ${C.BORDER}; }
+      .kpi { background:#fff; border:1px solid ${C.BORDER}; border-radius:12px; padding:14px 8px; text-align:center; }
+      .kpi .v { display:block; font-size:22px; font-weight:700; color:${C.PRIMARY}; }
+      .kpi .l { display:block; margin-top:5px; font-size:10px; color:${C.MUTED}; text-transform:uppercase; font-weight:700; }
+      .kpi.accent .v { color:${C.ACCENT}; }
+      .kpi.success .v { color:${C.SUCCESS}; }
+
+      .section { padding:20px 18px 6px 18px; }
+      .sec-title { font-size:17px; font-weight:700; color:${C.PRIMARY}; margin:0 0 12px 0; display:flex; align-items:center; }
+      .sec-title::before { content:""; width:4px; height:18px; border-radius:4px; background:${C.ACCENT}; display:inline-block; margin-right:10px; }
+
+      .event-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+      .event-card { border:1px solid ${C.BORDER}; border-radius:12px; padding:14px 12px; background:#fff; }
+      .event-card .val { font-size:22px; font-weight:700; color:${C.PRIMARY}; }
+      .event-card .lbl { font-size:12px; color:${C.MUTED}; margin-top:4px; }
+      .event-card.red { background:${C.LIGHT_RED}; }
+      .event-card.purple { background:${C.LIGHT_PURPLE}; }
+      .event-card.green { background:${C.LIGHT_GREEN}; }
+      .event-card.yellow { background:${C.LIGHT_YELLOW}; }
+
+      .two-col { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+      .card { border:1px solid ${C.BORDER}; border-radius:12px; background:#fff; padding:14px; }
+
+      .table-scroll { overflow-x:auto; display:block; width:100%; }
+      table { width:100%; border-collapse:collapse; min-width:460px; }
+      th { background:${C.PRIMARY}; color:#fff; font-size:11px; padding:9px 8px; text-align:left; white-space:nowrap; }
+      td { padding:8px; font-size:12px; border-bottom:1px solid #F0F2F5; vertical-align:top; }
+      tr:nth-child(even) td { background:#FCFCFE; }
+      .right { text-align:right; }
+      .money { color:${C.SUCCESS}; font-weight:700; }
+      .muted { color:${C.MUTED}; }
+      .warn { color:${C.ACCENT}; font-weight:700; }
+      .tag { display:inline-block; padding:3px 8px; border-radius:999px; font-size:10px; font-weight:700; background:${C.LIGHT_PURPLE}; color:${C.PRIMARY}; }
+
+      .bars .row { 
+  display:flex; 
+  align-items:flex-start; 
+  gap:8px; 
+  margin-bottom:10px; 
+}
+.bars .lab { 
+  flex:0 0 260px;
+  font-size:12px; 
+  color:${C.TEXT};
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  word-break:break-word;
+  line-height:1.25;
+}
+.bars .barbox { 
+  flex:1; 
+  height:8px; 
+  border-radius:999px; 
+  background:#EEF1F6; 
+  overflow:hidden; 
+  margin-top:4px;
+}
+.bars .bar { 
+  height:100%; 
+  background:${C.PRIMARY}; 
+}
+.bars .num { 
+  width:40px; 
+  text-align:right; 
+  font-size:12px; 
+  font-weight:700; 
+  padding-top:1px;
+}
+
+      .footer { padding:18px; background:#FAFBFD; border-top:1px solid ${C.BORDER}; color:${C.MUTED}; font-size:11px; text-align:center; }
+      .cut-note { margin-top:8px; color:#B26A00; background:${C.LIGHT_YELLOW}; border:1px solid #F5DFA8; border-radius:10px; padding:8px 10px; font-size:11px; }
+    </style>
+  `;
+
+  const headerHtml = `
+    <div class="header">
+      <div class="logo">
+        <img src="${CFG.LOGO_URL}" alt="Ventra GO">
+      </div>
+      <h1 class="title">Оперметрики GO</h1>
+      <div class="subtitle">PRO-отчет ${periodStr}</div>
+    </div>
+  `;
+
+  const kpiHtml = `
+    <div class="kpi-grid">
+      <div class="kpi"><span class="v">${m.kpi.sent}</span><span class="l">Отправлено</span></div>
+      <div class="kpi"><span class="v">${m.kpi.unique}</span><span class="l">Клиентов</span></div>
+      <div class="kpi"><span class="v">${m.kpi.uniqueInvoices}</span><span class="l">Уник. счетов</span></div>
+      <div class="kpi accent"><span class="v">${m.kpi.quotaDeferred}</span><span class="l">Лимит квоты</span></div>
+      <div class="kpi accent"><span class="v">${m.kpi.totalErrors}</span><span class="l">Ошибки</span></div>
+      <div class="kpi success"><span class="v">${m.kpi.manualPushes}</span><span class="l">Ручные пуши</span></div>
+    </div>
+  `;
+
+  const eventsHtml = `
+    <div class="event-grid">
+      <div class="event-card purple"><div class="val">${m.events.newInvoices}</div><div class="lbl">Новые счета</div></div>
+      <div class="event-card"><div class="val">${m.events.dueSoon}</div><div class="lbl">1–3 дня до оплаты</div></div>
+      <div class="event-card red"><div class="val">${m.events.overdue1}</div><div class="lbl">Просрочка 1 день</div></div>
+      <div class="event-card red"><div class="val">${m.events.overdue7}</div><div class="lbl">Просрочка 7+ дней</div></div>
+      <div class="event-card red"><div class="val">${m.events.overdue30}</div><div class="lbl">Просрочка 30+ дней</div></div>
+      <div class="event-card"><div class="val">${m.kpi.windowMatched}</div><div class="lbl">Всего событий окна</div></div>
+    </div>
+  `;
+
+  const bucketsHtml = renderBarsBlock_("Распределение по бакетам", mapObjectToRows_(m.byBucket));
+  const procStatusHtml = renderBarsBlock_("Статусы обработки", m.procStatusRows);
+  const typeHtml = renderBarsBlock_("Тип / категория", m.typeRows);
+
+  let clientsHtml = `<div class="muted">Данных нет</div>`;
+  if (m.clients.rows.length) {
+    clientsHtml =
+      `<div class="table-scroll">` +
+      table_(
+        ["Клиент", "Счета", "Всего", "Новый", "До оплаты", "Пр.1", "Пр.7", "Пр.30"],
+        m.clients.rows.map(r => [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]),
+        { rightCols: [1,2,3,4,5,6,7] }
+      ) +
+      `</div>` +
+      (m.clients.hidden > 0 ? `<div class="cut-note">Скрыто клиентов: ${m.clients.hidden}</div>` : "");
+  }
+
+  let errHtml = `<div class="muted">Ошибок не зафиксировано</div>`;
+  if ((m.inlineErrors.rows && m.inlineErrors.rows.length) || (m.errSheet && m.errSheet.reasonRows.length)) {
+    errHtml = "";
+    if (m.inlineErrors.rows && m.inlineErrors.rows.length) {
+      errHtml += `<div style="margin-bottom:10px;">${table_(["Ошибка", "Шт."], m.inlineErrors.rows, { rightCols:[1] })}</div>`;
+    }
+    if (m.errSheet && m.errSheet.reasonRows.length) {
+      errHtml += `<div style="margin-bottom:8px;" class="tag">Лист "Ошибки"</div>`;
+      errHtml += table_(["Причина", "Шт."], m.errSheet.reasonRows, { rightCols:[1] });
+    }
+  }
+
+  let overdueHtml = `<div class="muted">Нет просрочки в окне</div>`;
+  if (m.overdueBlock) {
+    overdueHtml = `
+      <div style="margin-bottom:10px;">
+        <span class="tag">Счетов с просрочкой: ${m.overdueBlock.count}</span>
+        <span class="tag" style="margin-left:6px;">Сумма: ${moneyRu_(m.overdueBlock.sum)} ₽</span>
+        <span class="tag" style="margin-left:6px;">Max: ${m.overdueBlock.maxDays} д.</span>
+      </div>
+      ${table_(["Клиент", "Счет", "Проср., дн.", "Сумма"], m.overdueBlock.topRows, { rightCols:[2,3] })}
+    `;
+  }
+
+  let payHtml = `<div class="muted">Оплат сегодня не найдено</div>`;
+  if (m.paymentsToday.rows.length) {
+    const pRows = m.paymentsToday.rows.map(r => [
+      `<div style="font-weight:700">${r[0]}</div><div class="muted" style="font-size:10px">${r[1]}</div>`,
+      `<div>${r[2]}</div><div class="muted" style="font-size:10px">${r[3]}</div>`,
+      `<span class="money">${r[4]}</span>`
+    ]);
+
+    payHtml = `
+      <div style="margin-bottom:10px;">
+        <span class="tag">Оплат: ${m.paymentsToday.count}</span>
+        <span class="tag" style="margin-left:6px;">Сумма: ${moneyRu_(m.paymentsToday.sum)} ₽</span>
+      </div>
+      <div class="table-scroll">${table_(["Счет / дата", "Клиент / инфо", "Сумма"], pRows, { rightCols:[2] })}</div>
+      ${m.paymentsToday.hidden > 0 ? `<div class="cut-note">Скрыто оплат: ${m.paymentsToday.hidden}</div>` : ""}
+    `;
+  }
+
+  let missingHtml = "";
+  if (m.missingEmails && m.missingEmails.rows.length) {
+    missingHtml = `
+      <div class="section">
+        <div class="sec-title">Пропуски: не найдена почта</div>
+        <div class="table-scroll">
+          ${table_(["Клиент", "Попыток", "Счета"], m.missingEmails.rows.map(r => [r[0], r[1], r[3] || "—"]), { rightCols:[1] })}
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <html>
+      <head>${css}</head>
+      <body>
+        <div class="wrap">
+          <div class="container">
+            ${headerHtml}
+            ${kpiHtml}
+
+            <div class="section">
+              <div class="sec-title">События за период</div>
+              ${eventsHtml}
+            </div>
+
+            <div class="section">
+              <div class="two-col">
+                <div class="card">${bucketsHtml}</div>
+                <div class="card">${procStatusHtml}</div>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="two-col">
+                <div class="card">${typeHtml}</div>
+                <div class="card">${overdueHtml}</div>
+              </div>
+            </div>
+
+            <div class="section">
+              <div class="sec-title">Активность клиентов</div>
+              ${clientsHtml}
+            </div>
+
+            <div class="section">
+              <div class="sec-title">Ошибки и отклонения</div>
+              ${errHtml}
+            </div>
+
+            ${missingHtml}
+
+            <div class="section">
+              <div class="sec-title">Оплаты за сегодня</div>
+              ${payHtml}
+            </div>
+
+            <div class="footer">
+              Сформировано: ${nowStr} · Лист: ${CFG.SHEETS.REESTR}
+              <br>
+              Реестр: ${m.tech.registryTotalRows} строк
+              ${m.tech.vygruzkaTotalRows != null ? ` · ${PDZ_IMPORT_SHEET_NAME}: ${m.tech.vygruzkaTotalRows} строк` : ""}
+            </div>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+}
+
+/** ===== АНАЛИТИКА ПРОСРОЧКИ ===== */
+function buildOverdueAnalytics_(values, ctx) {
+  const { from, now, tz, iLast, iOverdue, iContr, iSum, iInvoice } = ctx;
+  if (iLast === -1 || iOverdue === -1) return null;
+
+  let count = 0;
+  let sum = 0;
+  let maxDays = 0;
+  const top = [];
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const ts = parseTS_(row[iLast]);
+    if (!ts || ts < from || ts > now) continue;
+
+    const overdue = Number(row[iOverdue] || 0);
+    if (!Number.isFinite(overdue) || overdue <= 0) continue;
+
+    const money = moneyToNumber_(iSum !== -1 ? row[iSum] : 0);
+    const client = iContr !== -1 ? str_(row[iContr]) : "—";
+    const inv = iInvoice !== -1 ? str_(row[iInvoice]) : "—";
+
+    count++;
+    sum += money;
+    if (overdue > maxDays) maxDays = overdue;
+
+    top.push([client, inv, overdue, moneyRu_(money)]);
+  }
+
+  top.sort((a, b) => Number(String(b[3]).replace(/\s/g, "")) - Number(String(a[3]).replace(/\s/g, "")));
+
+  return {
+    count,
+    sum,
+    maxDays,
+    topRows: top.slice(0, 10),
+  };
+}
+
+/** ===== ХЕЛПЕРЫ ДЛЯ ВИЗУАЛА ===== */
+function renderBarsBlock_(title, rows) {
+  if (!rows || !rows.length) {
+    return `<div><div style="font-weight:700;margin-bottom:10px;">${esc_(title)}</div><div class="muted">Нет данных</div></div>`;
+  }
+
+  const max = Math.max.apply(null, rows.map(r => Number(r[1] || 0))) || 1;
+  let html = `<div><div style="font-weight:700;margin-bottom:10px;">${esc_(title)}</div><div class="bars">`;
+
+  rows.forEach(r => {
+    const label = esc_(r[0]);
+    const val = Number(r[1] || 0);
+    const width = Math.max(4, Math.round((val / max) * 100));
+    html += `
+      <div class="row">
+        <div class="lab" title="${label}">${label}</div>
+        <div class="barbox"><div class="bar" style="width:${width}%"></div></div>
+        <div class="num">${val}</div>
+      </div>
+    `;
+  });
+
+  html += `</div></div>`;
+  return html;
+}
+
+function mapObjectToRows_(obj) {
+  return Object.keys(obj || {})
+    .map(k => [k, Number(obj[k] || 0)])
+    .sort((a, b) => b[1] - a[1]);
+}
+
+function mapToSortedRows_(map, limit) {
+  if (!map || !map.size) return [];
+  return [...map.entries()]
+    .map(([k, v]) => [k, Number(v || 0)])
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit || 20);
+}
+
+function normalizeDateStr_(v, tz) {
+  const d = parseTS_(v);
+  return d ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : str_(v);
+}
+
+/** ===== ОБЩИЕ UTIL ===== */
+function table_(headers, rows, opts = {}) {
+  const right = new Set(opts.rightCols || []);
+  let h = `<table><thead><tr>`;
+  headers.forEach((hdr, i) => h += `<th class="${right.has(i) ? "right" : ""}">${esc_(hdr)}</th>`);
+  h += `</tr></thead><tbody>`;
+
+  rows.forEach(row => {
+    h += `<tr>`;
+    row.forEach((cell, i) => {
+      const css = right.has(i) ? "right" : "";
+      h += `<td class="${css}">${cell}</td>`;
+    });
+    h += `</tr>`;
+  });
+
+  h += `</tbody></table>`;
+  return h;
+}
+
+function readSheet_(ss, name) {
+  const s = ss.getSheetByName(name);
+  return s ? { ok: true, values: s.getDataRange().getValues() } : { ok: false };
+}
+
+function headerIndex_(row) {
+  const m = new Map();
+  row.forEach((v, i) => m.set(String(v).trim(), i));
+  return m;
+}
+
+function col_(m, name) {
+  return m.has(name) ? m.get(name) : -1;
+}
+
+function firstOf_(m, names) {
+  for (const n of names) if (m.has(n)) return m.get(n);
+  return -1;
+}
+
+function limitRows_(rows, lim) {
+  return {
+    total: rows.length,
+    cut: rows.slice(0, lim),
+    hidden: Math.max(0, rows.length - lim),
+  };
+}
+
+function clipText_(s, n) {
+  s = String(s || "");
+  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+}
+
+function str_(v) {
+  return String(v || "").trim();
+}
+
+function moneyToNumber_(v) {
+  if (typeof v === "number") return v;
+  const n = parseFloat(String(v).replace(/\s/g, "").replace(",", "."));
+  return isNaN(n) ? 0 : n;
+}
+
+function moneyRu_(n) {
+  return Number(n || 0).toLocaleString("ru-RU", { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+}
+
+function esc_(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  }[c]));
+}
+
+function parseTS_(s) {
+  if (s instanceof Date) return s;
+  if (!s) return null;
+
+  const str = String(s).trim();
+
+  let d = new Date(str);
+  if (!isNaN(d)) return d;
+
+  let m = str.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    return new Date(
+      +m[3],
+      +m[2] - 1,
+      +m[1],
+      +(m[4] || 0),
+      +(m[5] || 0),
+      +(m[6] || 0)
+    );
+  }
+
+  return null;
+}
+
+function dayOnly_(v, tz) {
+  const d = parseTS_(v);
+  return d ? Utilities.formatDate(d, tz, "yyyy-MM-dd") : null;
+}
+
+function incMap_(map, key) {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+/** ===== ОПЛАТЫ ЗА СЕГОДНЯ ===== */
+function buildPaymentsToday_(values, ctx) {
+  const {
+    tz, now, iPayStatus, iPayTs, iProc, iComment, iInvoice, iInvDate, iContr, iSum
+  } = ctx;
+
+  const todayDay = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+  const res = { count: 0, sum: 0, rows: [], hidden: 0 };
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+
+    const kind =
+      paidKind_(iPayStatus, row) ||
+      paidKindText_(iProc, row) ||
+      paidKindText_(iComment, row);
+
+    if (!kind) continue;
+
+    const payTs = extractPayDate_(row, { iPayTs, iComment, iProc, iPayStatus });
+    if (!payTs || Utilities.formatDate(payTs, tz, "yyyy-MM-dd") !== todayDay) continue;
+
+    const sumVal = moneyToNumber_(iSum !== -1 ? row[iSum] : 0);
+
+    res.count++;
+    res.sum += sumVal;
+    res.rows.push([
+      (iInvoice !== -1 ? str_(row[iInvoice]) : "—"),
+      dayOnly_(iInvDate !== -1 ? row[iInvDate] : null, tz) || "",
+      (iContr !== -1 ? str_(row[iContr]) : "(нет назв)"),
+      clipText_((iComment !== -1 ? str_(row[iComment]) : ""), CFG.LIMITS.CELL_TEXT),
+      moneyRu_(sumVal)
+    ]);
+  }
+
+  res.rows.sort((a, b) =>
+    moneyToNumber_(String(b[4]).replace(/\s/g, "")) - moneyToNumber_(String(a[4]).replace(/\s/g, ""))
+  );
+
+  return res;
+}
+
+function paidKind_(idx, row) {
+  if (idx === -1) return null;
+  return checkPaidStr_(row[idx]);
+}
+
+function paidKindText_(idx, row) {
+  if (idx === -1) return null;
+  return checkPaidStr_(row[idx]);
+}
+
+function checkPaidStr_(v) {
+  const t = String(v || "").toLowerCase();
+  if (/(?:\s|^)(на|->|→)\s*['"]?\s*(частичн[^\n\r]*оплачен|оплачен)/i.test(t)) return "paid";
+  if (/(оплачен|оплачено|оплачена)/i.test(t)) return "paid";
+  return null;
+}
+
+function extractPayDate_(row, ix) {
+  if (ix.iPayTs !== -1) {
+    const d = parseTS_(row[ix.iPayTs]);
+    if (d) return d;
+  }
+
+  const txt = [ix.iComment, ix.iProc, ix.iPayStatus]
+    .map(i => i !== -1 ? row[i] : "")
+    .join(" ");
+
+  const m = txt.match(/дата\s*оплат[ыа]\s*[:\-]\s*(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4})/i);
+  if (m) return parseTS_(m[1]);
+
+  return null;
+}
+
+/** ===== КЛИЕНТСКАЯ АГРЕГАЦИЯ ===== */
+function accClient_(map, client, bucketName, invoiceRaw) {
+  const key = client || "(без названия)";
+  if (!map.has(key)) {
+    const init = {
+      total: 0,
+      perBucket: {},
+      invoices: new Set(),
+    };
+    CFG.BUCKETS.forEach(b => init.perBucket[b] = 0);
+    map.set(key, init);
+  }
+
+  const rec = map.get(key);
+  rec.total += 1;
+
+  if (bucketName && rec.perBucket.hasOwnProperty(bucketName)) {
+    rec.perBucket[bucketName] += 1;
+  }
+
+  if (invoiceRaw) {
+    rec.invoices.add(str_(invoiceRaw));
+  }
+}
+
+function buildClientsRows_(clientsMap, ctx) {
+  const rows = [];
+  for (const [client, rec] of clientsMap.entries()) {
+    rows.push([
+      client,
+      ctx.useInvoiceSet ? rec.invoices.size : "—",
+      rec.total,
+      ...ctx.buckets.map(b => rec.perBucket[b] || 0),
+    ]);
+  }
+  return rows.sort((a, b) => b[2] - a[2]);
+}
+
+/** ===== INLINE ERRORS ===== */
+function buildInlineErrorsRows_(errorsInline, limits) {
+  const byMsg = new Map();
+
+  errorsInline.forEach(e => {
+    byMsg.set(e.status, (byMsg.get(e.status) || 0) + 1);
+  });
+
+  const rows = [...byMsg.entries()]
+    .map(([msg, count]) => [clipText_(msg, limits.CELL_TEXT), count])
+    .sort((a, b) => b[1] - a[1]);
+
+  return limitRows_(rows, limits.INLINE_ERR_ROWS);
+}
+
+/** ===== MISSING EMAIL ===== */
+function buildMissingEmailsBlock_(items, ctx) {
+  if (!items.length) return null;
+
+  const byClient = new Map();
+
+  items.forEach(it => {
+    if (!byClient.has(it.client)) {
+      byClient.set(it.client, { count: 0, invoices: new Set() });
+    }
+    const o = byClient.get(it.client);
+    o.count++;
+    if (it.invoice) o.invoices.add(it.invoice);
+  });
+
+  const rows = [...byClient.entries()]
+    .map(([k, v]) => [k, v.count, ctx.useInvoiceSet ? v.invoices.size : "—", [...v.invoices].slice(0, 8).join(", ")])
+    .sort((a, b) => b[1] - a[1]);
+
+  const lr = limitRows_(rows, ctx.limits.MISSING_EMAIL_ROWS);
+  return { total: items.length, rows: lr.cut, hidden: lr.hidden };
+}
+
+/** ===== ERR SHEET ===== */
+function buildErrSheetBlock_(ss, ctx) {
+  const sh = ss.getSheetByName(ctx.sheetName);
+  if (!sh) return null;
+
+  const v = sh.getDataRange().getValues();
+  if (v.length < 2) return null;
+
+  const H = headerIndex_(v[0]);
+  const iDate = firstOf_(H, ["Дата", "Время", "Updated at"]);
+  const iClient = firstOf_(H, ["Контрагент", "Клиент"]);
+  const iComm = firstOf_(H, ["Комментарий ошибки", "Комментарий", "Ошибка"]);
+
+  if (iDate === -1 || iComm === -1) return null;
+
+  const parsed = [];
+  for (let r = 1; r < v.length; r++) {
+    const d = parseTS_(v[r][iDate]);
+    if (!d || d < ctx.from || d > ctx.now) continue;
+
+    parsed.push({
+      client: (iClient !== -1 ? str_(v[r][iClient]) : ""),
+      msg: str_(v[r][iComm]),
+    });
+  }
+
+  const byReason = new Map();
+  parsed.forEach(p => byReason.set(p.msg, (byReason.get(p.msg) || 0) + 1));
+
+  const reasonRows = [...byReason.entries()]
+    .map(([r, c]) => [clipText_(r, 100), c])
+    .sort((a, b) => b[1] - a[1]);
+
+  return {
+    reasonRows: limitRows_(reasonRows, ctx.limits.ERR_REASON_ROWS).cut,
+  };
+}
+
+function removeMissingFromRegistry() {
+  getMainSpreadsheet_().toast(
+    'Операция отключена: скрипт больше не удаляет строки из "Реестр".',
+    "Безопасность",
+    6
+  );
+}
+
+
+function dedupeRegistryKeepLatest() {
+  getMainSpreadsheet_().toast(
+    'Операция отключена: дедупликация с удалением строк из "Реестр" недоступна.',
+    "Безопасность",
+    6
+  );
+}
+
+/*******************************
+ * GO • Сверка "Реестр" vs внешняя "Выгрузка"
+ *******************************/
+const CHECK_SUM_COL = 33; // AG
+const CHECK_SUM_HEADER = "Сумма чек";
+const CHECK_MISSING_COL = 34; // AH
+const CHECK_MISSING_HEADER = "Сверка выгрузки";
+const CHECK_MISSING_STATUS = "Нет в выгрузке";
+const CHECK_RED = "#F4CCCC";
+const CHECK_YELLOW = "#FFF2CC";
+
+function checkKey_(num, contr, date) {
+  const n = (num || "").toString().replace(/\u00A0/g, " ").trim();
+  const c = (contr || "").toString().replace(/\u00A0/g, " ").trim();
+  const d = parseCheckYmd_(date);
+  return n && c && d ? `${n}|${normalizeKA_(c)}|${d}` : "";
+}
+
+function parseCheckYmd_(v) {
+  if (!v) return "";
+  if (v instanceof Date && !isNaN(v)) return Utilities.formatDate(v, getSpreadsheetTimeZone_(), DATE_FMT);
+
+  const s = String(v).trim();
+  const m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const d = new Date(s);
+  return isNaN(d) ? "" : Utilities.formatDate(d, getSpreadsheetTimeZone_(), DATE_FMT);
+}
+
+function readCheckColumns_(sheet, columnNames, errorPrefix) {
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 2) throw new Error(`${errorPrefix} нет данных для сверки`);
+
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(x => (x || "").toString().trim());
+  const idx = getColumnIndexes(header, columnNames);
+  const missing = columnNames.filter(name => idx[name] === -1);
+  if (missing.length) throw new Error(`${errorPrefix} нужны колонки: ${missing.map(x => `"${x}"`).join(", ")}`);
+
+  const rowCount = lastRow - 1;
+  const cols = {};
+  columnNames.forEach(name => {
+    cols[name] = sheet.getRange(2, idx[name] + 1, rowCount, 1).getValues().map(r => r[0]);
+  });
+
+  return { sh: sheet, header, idx, cols, rowCount, lastRow, lastCol };
+}
+
+function loadLatestImportForCheck_() {
+  const sh = getImportSheet_();
+  const required = [
+    COLS.REGISTRY.NUMBER,
+    COLS.REGISTRY.CONTR,
+    COLS.REGISTRY.DATE,
+    COLS.REGISTRY.SUM,
+    COLS.REGISTRY.UPDATED_AT
+  ];
+  const src = readCheckColumns_(sh, required, `В "${PDZ_IMPORT_SHEET_NAME}"`);
+
+  let latestYmd = "";
+  for (let i = 0; i < src.rowCount; i++) {
+    const ymd = parseCheckYmd_(src.cols[COLS.REGISTRY.UPDATED_AT][i]);
+    if (ymd && ymd > latestYmd) latestYmd = ymd;
+  }
+  if (!latestYmd) throw new Error(`В "${PDZ_IMPORT_SHEET_NAME}" не найдена дата в колонке "Дата обновления"`);
+
+  const rows = [];
+  for (let i = 0; i < src.rowCount; i++) {
+    if (parseCheckYmd_(src.cols[COLS.REGISTRY.UPDATED_AT][i]) === latestYmd) rows.push(i);
+  }
+
+  return { ...src, rows, latestYmd };
+}
+
+function loadRegistryForCheck_() {
+  const sh = getMainSpreadsheet_().getSheetByName("Реестр");
+  if (!sh) throw new Error('Лист "Реестр" не найден');
+
+  const required = [
+    COLS.REGISTRY.NUMBER,
+    COLS.REGISTRY.CONTR,
+    COLS.REGISTRY.DATE,
+    COLS.REGISTRY.SUM
+  ];
+  const src = readCheckColumns_(sh, required, 'В "Реестр"');
+
+  const byKey = new Map();
+  for (let i = 0; i < src.rowCount; i++) {
+    const key = checkKey_(
+      src.cols[COLS.REGISTRY.NUMBER][i],
+      src.cols[COLS.REGISTRY.CONTR][i],
+      src.cols[COLS.REGISTRY.DATE][i]
+    );
+    if (!key) continue;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(i);
+  }
+
+  return { ...src, byKey };
+}
+
+function ensureCheckSumColumn_(sheet) {
+  if (sheet.getMaxColumns() < CHECK_SUM_COL) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), CHECK_SUM_COL - sheet.getMaxColumns());
+  }
+
+  const current = (sheet.getRange(1, CHECK_SUM_COL).getValue() || "").toString().trim();
+  if (current !== CHECK_SUM_HEADER) sheet.getRange(1, CHECK_SUM_COL).setValue(CHECK_SUM_HEADER);
+  return CHECK_SUM_COL - 1;
+}
+
+function ensureMissingCheckColumn_(sheet) {
+  if (sheet.getMaxColumns() < CHECK_MISSING_COL) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), CHECK_MISSING_COL - sheet.getMaxColumns());
+  }
+
+  const current = (sheet.getRange(1, CHECK_MISSING_COL).getValue() || "").toString().trim();
+  if (current !== CHECK_MISSING_HEADER) sheet.getRange(1, CHECK_MISSING_COL).setValue(CHECK_MISSING_HEADER);
+  return CHECK_MISSING_COL - 1;
+}
+
+function quoteSheetA1_(name) {
+  return `'${String(name).replace(/'/g, "''")}'`;
+}
+
+function updateColumnValuesFast_(spreadsheetId, sheetName, colNumber, rowValues, startRow) {
+  if (!rowValues.length) return;
+  const col = _colA1(colNumber);
+  const range = `${quoteSheetA1_(sheetName)}!${col}${startRow}:${col}${startRow + rowValues.length - 1}`;
+  Sheets.Spreadsheets.Values.update(
+    { values: rowValues },
+    spreadsheetId,
+    range,
+    { valueInputOption: "RAW" }
+  );
+}
+
+function applyMissingConditionalFormat_(sheet, lastRow, lastCol) {
+  if (lastRow < 2) return;
+
+  const formula = `=$AH2="${CHECK_MISSING_STATUS}"`;
+  const dataRange = sheet.getRange(2, 1, lastRow - 1, lastCol);
+  const rules = sheet.getConditionalFormatRules().filter(rule => {
+    const cond = rule.getBooleanCondition && rule.getBooleanCondition();
+    const vals = cond ? cond.getCriteriaValues() : [];
+    return !(vals && vals[0] === formula);
+  });
+
+  rules.push(
+    SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(formula)
+      .setBackground(CHECK_RED)
+      .setRanges([dataRange])
+      .build()
+  );
+  sheet.setConditionalFormatRules(rules);
+}
+
+function setupMissingRegistryHighlight() {
+  const sh = getMainSpreadsheet_().getSheetByName("Реестр");
+  if (!sh) throw new Error('Лист "Реестр" не найден');
+  ensureMissingCheckColumn_(sh);
+  applyMissingConditionalFormat_(sh, sh.getLastRow(), Math.max(sh.getLastColumn(), CHECK_MISSING_COL));
+  getMainSpreadsheet_().toast("Красная подсветка по колонке AH настроена", "Сверка", 5);
+}
+
+function colorMissingLatestImportInRegistry() {
+  return withLock_(() => {
+    const imp = loadLatestImportForCheck_();
+    const reg = loadRegistryForCheck_();
+    ensureMissingCheckColumn_(reg.sh);
+    const importKeys = new Set();
+    const statusValues = Array.from({ length: reg.rowCount }, () => [""]);
+    let missing = 0;
+
+    imp.rows.forEach(r => {
+      const key = checkKey_(
+        imp.cols[COLS.REGISTRY.NUMBER][r],
+        imp.cols[COLS.REGISTRY.CONTR][r],
+        imp.cols[COLS.REGISTRY.DATE][r]
+      );
+      if (key) importKeys.add(key);
+    });
+
+    for (let r = 0; r < reg.rowCount; r++) {
+      const key = checkKey_(
+        reg.cols[COLS.REGISTRY.NUMBER][r],
+        reg.cols[COLS.REGISTRY.CONTR][r],
+        reg.cols[COLS.REGISTRY.DATE][r]
+      );
+
+      if (key && !importKeys.has(key)) {
+        statusValues[r][0] = CHECK_MISSING_STATUS;
+        missing++;
+      }
+    }
+
+    updateColumnValuesFast_(PDZ_MAIN_SPREADSHEET_ID, reg.sh.getName(), CHECK_MISSING_COL, statusValues, 2);
+
+    getMainSpreadsheet_().toast(
+      `Сверка ключей завершена. Дата ${imp.latestYmd}; не найдено в "${PDZ_IMPORT_SHEET_NAME}": ${missing}`,
+      "Сверка",
+      7
+    );
+  });
+}
+
+function colorAmountDiffsAndWriteCheckSum() {
+  return withLock_(() => {
+    const imp = loadLatestImportForCheck_();
+    const reg = loadRegistryForCheck_();
+    ensureCheckSumColumn_(reg.sh);
+    const importByKey = new Map();
+    const checkRange = reg.sh.getRange(2, CHECK_SUM_COL, reg.rowCount, 1);
+    const checkValues = Array.from({ length: reg.rowCount }, () => [""]);
+    const checkBackgrounds = Array.from({ length: reg.rowCount }, () => [null]);
+
+    imp.rows.forEach(r => {
+      const key = checkKey_(
+        imp.cols[COLS.REGISTRY.NUMBER][r],
+        imp.cols[COLS.REGISTRY.CONTR][r],
+        imp.cols[COLS.REGISTRY.DATE][r]
+      );
+      if (!key) return;
+      importByKey.set(key, toNumberRu_(imp.cols[COLS.REGISTRY.SUM][r]));
+    });
+
+    let diffs = 0;
+    importByKey.forEach((importSum, key) => {
+      const rowIdxs = reg.byKey.get(key);
+      if (!rowIdxs) return;
+
+      rowIdxs.forEach(r => {
+        const registrySum = toNumberRu_(reg.cols[COLS.REGISTRY.SUM][r]);
+
+        if (importSum !== null && registrySum !== null && Math.abs(importSum - registrySum) > 0.01) {
+          checkValues[r][0] = importSum;
+          checkBackgrounds[r][0] = CHECK_YELLOW;
+          diffs++;
+        } else {
+          checkValues[r][0] = "";
+          checkBackgrounds[r][0] = null;
+        }
+      });
+    });
+
+    checkRange.setValues(checkValues);
+    checkRange.setBackgrounds(checkBackgrounds);
+
+    getMainSpreadsheet_().toast(
+      `Сверка сумм завершена. Дата ${imp.latestYmd}; расхождений: ${diffs}`,
+      "Сверка",
+      7
+    );
+  });
+}
+
+/*******************************
+ * GO • Единая панель и врапперы
+ *******************************/
+
+/** Враппер: прогнать updatePaymentStatusLog() до конца */
+function runPaylogFull() {
+  let state = {};
+  // защита от бесконечного цикла — максимум 200 итераций
+  for (let i = 0; i < 200; i++) {
+    state = updatePaymentStatusLog(state) || {};
+    if ((state.paylogRow || 1) === 1) break;  // дошли до конца
+    Utilities.sleep(50);
+  }
+  getMainSpreadsheet_().toast("Лог оплат: обновление завершено", "OK", 4);
+}
+
+/** Враппер: прогнать updateStagesAndOverdueDays() до конца */
+function runStagesFull() {
+  let state = {};
+  for (let i = 0; i < 200; i++) {
+    state = updateStagesAndOverdueDays(state) || {};
+    if ((state.stagesRow || 1) === 1) break;
+    Utilities.sleep(50);
+  }
+  getMainSpreadsheet_().toast("Стадии/просрочки: обновление завершено", "OK", 4);
+}
+
+/** Враппер: прогнать рассылку по группам, пока не done или не упрёмся в ограничение */
+function runStageEmailsFull() {
+  let state = {};
+  for (let i = 0; i < 50; i++) { // не злоупотребляем длительностью
+    state = sendStageEmails(state) || {};
+    if (state.done) break;
+    Utilities.sleep(200);
+  }
+  getMainSpreadsheet_().toast("Рассылка этапов: проход завершён", "OK", 4);
+}
+
+/** Враппер: полный основной пайплайн */
+function runMainPipeline() {
+  mainUpdatePipeline();
+  getMainSpreadsheet_().toast("Полный пайплайн запущен", "Готово", 5);
+}
+
+/** Единое меню */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  const dailyMenu = ui.createMenu("1. Ежедневный цикл")
+    .addItem("Запустить полный пайплайн", "runMainPipeline")
+    .addSeparator()
+    .addItem(`Импорт вложения в "${PDZ_IMPORT_SHEET_NAME}"`, "importLastExportFromMail")
+    .addItem("Обновить сроки и Реестр", "updateDueDatesAndRegistry")
+    .addItem("Синхронизировать Счета ОС", "applyOSInvoicesToRegistry")
+    .addItem("Обновить логи оплат", "runPaylogFull")
+    .addItem("Пересчитать стадии и просрочки", "runStagesFull")
+    .addItem("Разослать письма пакетно", "runStageEmailsFull")
+    .addItem("Добавить поля ПДЗ и валидации", "addPDZFieldsAndDropdown");
+
+  const checkMenu = ui.createMenu("2. Сверка с выгрузкой")
+    .addItem("Настроить красную подсветку", "setupMissingRegistryHighlight")
+    .addSeparator()
+    .addItem(`Красным: есть в Реестре, нет в "${PDZ_IMPORT_SHEET_NAME}"`, "colorMissingLatestImportInRegistry")
+    .addItem("Желтым: разные суммы + AG", "colorAmountDiffsAndWriteCheckSum");
+
+  const manualMenu = ui.createMenu("3. Ручные действия")
+    .addItem("Отправить письмо вручную", "sendManualInvoicePush")
+    .addItem("Тест шаблона письма", "testSendInvoiceEmail");
+
+  const reportsMenu = ui.createMenu("4. Отчеты и аналитика")
+    .addItem("PDZ 31+ — отправить по умолчанию", "sendPDZSummaryEmail")
+    .addItem("PDZ 31+ — отправить на адрес...", "sendPDZSummaryEmailPrompt_")
+    .addSeparator()
+    .addItem("Оперметрики 24ч", "sendOpsMetricsEmail24")
+    .addItem("Оперметрики 48ч", "sendOpsMetricsEmail48")
+    .addItem("PRO-аудит Реестра", "sendProAuditEmail")
+    .addSeparator()
+    .addItem("Анализ PDZ по клиентам", "buildPDZClientStats")
+    .addItem("Проблемные 29+ дней", "buildProblemRegistry29d");
+
+  const serviceMenu = ui.createMenu("5. Сервис")
+    .addItem(`Очистить "${PDZ_IMPORT_SHEET_NAME}" до даты...`, "purgeVygruzkaBeforeDate_")
+    .addItem("Безопасность: удаление строк отключено", "removeMissingFromRegistry")
+    .addItem("Безопасность: дедуп удалением отключен", "dedupeRegistryKeepLatest");
+
+  ui.createMenu("GO • Контроль ПДЗ")
+    .addSubMenu(dailyMenu)
+    .addSubMenu(checkMenu)
+    .addSubMenu(manualMenu)
+    .addSubMenu(reportsMenu)
+    .addSubMenu(serviceMenu)
+    .addToUi();
+}
+
+
+function sendManualInvoicePush() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = getMainSpreadsheet_();
+
+  const resp = ui.prompt(
+    "Ручная отправка письма",
+    "Введите НОМЕР счета или КОНТРАГЕНТА",
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (resp.getSelectedButton() !== ui.Button.OK) return;
+
+  const query = (resp.getResponseText() || "").trim();
+  if (!query) {
+    ui.alert("Ничего не введено");
+    return;
+  }
+
+  const sheet = ss.getSheetByName("Реестр");
+  const mailSheet = ss.getSheetByName("Почта КА");
+  if (!sheet || !mailSheet) throw new Error("Нет листа 'Реестр' или 'Почта КА'");
+
+  const data = sheet.getDataRange().getValues();
+  const header = data[0].slice();
+
+  const col = (n) => header.indexOf(n);
+
+  const iNum   = col(COLS.REGISTRY.NUMBER);
+  const iContr = col(COLS.REGISTRY.CONTR);
+  const iDate  = col(COLS.REGISTRY.DATE);
+  const iSum   = col(COLS.REGISTRY.SUM);
+  const iDue   = col(COLS.REGISTRY.DUE);
+  const iComm  = col(COLS.REGISTRY.COMMENT);
+  const iPay   = col(COLS.REGISTRY.PAY_STATUS);
+  const iOver  = col(COLS.REGISTRY.OVERDUE);
+
+  if ([iNum, iContr, iDate, iSum, iDue, iComm, iPay].some(x => x === -1)) {
+    throw new Error("В 'Реестр' не хватает обязательных колонок");
+  }
+
+  const ensureCol = (name) => {
+    let idx = header.indexOf(name);
+    if (idx === -1) {
+      idx = header.length;
+      sheet.getRange(1, idx + 1).setValue(name);
+      header.push(name);
+      for (let r = 1; r < data.length; r++) data[r].push("");
+    }
+    return idx;
+  };
+
+  const iProc = ensureCol(COLS.REGISTRY.PROCESS_STATUS);
+  const iSent = ensureCol(COLS.REGISTRY.LAST_SENT_AT);
+
+  const queryNorm = normalizeKA_(query);
+  const iReason = header.indexOf("Причина ПДЗ");
+  const isInvoiceSearch = data.some((row, r) => r > 0 && String(row[iNum] || "").trim() === query);
+
+  let rowIdxs = [];
+
+  if (isInvoiceSearch) {
+   for (let i = 1; i < data.length; i++) {
+  if (String(data[i][iNum] || "").trim() !== query) continue;
+  if (_isPaid_(data[i][iPay])) continue;
+
+  // НЕ ПДЗ — игнор
+  if (iReason !== -1 && _isNotPDZ_(data[i][iReason])) continue;
+
+  rowIdxs.push(i);
+}
+
+    if (!rowIdxs.length) {
+      ui.alert("Счет найден, но он уже оплачен либо нет неоплаченных строк");
+      return;
+    }
+  } else {
+    for (let i = 1; i < data.length; i++) {
+  const contrName = (data[i][iContr] || "").toString().trim();
+  if (!contrName) continue;
+  if (normalizeKA_(contrName) !== queryNorm) continue;
+  if (_isPaid_(data[i][iPay])) continue;
+
+  // НЕ ПДЗ — игнор
+  if (iReason !== -1 && _isNotPDZ_(data[i][iReason])) continue;
+
+  rowIdxs.push(i);
+}
+
+    if (!rowIdxs.length) {
+      ui.alert("Не найден контрагент с неоплаченными счетами: " + query);
+      return;
+    }
+  }
+
+  const contrName = (data[rowIdxs[0]][iContr] || "").toString().trim();
+  if (!contrName) {
+    ui.alert("Не удалось определить контрагента");
+    return;
+  }
+
+  // проверяем, что все счета одного контрагента
+  const differentContr = rowIdxs.some(i => normalizeKA_(data[i][iContr]) !== normalizeKA_(contrName));
+  if (differentContr) {
+    ui.alert("Найдены строки разных контрагентов. Отправка отменена.");
+    return;
+  }
+
+  const mailData = mailSheet.getDataRange().getValues();
+  const mailHdr = mailData[0];
+  const iMContr = mailHdr.indexOf("Контрагент");
+  const iMail   = mailHdr.indexOf("Почта");
+  const iCSM    = mailHdr.indexOf("CSM");
+
+  let emailInfo = null;
+  const contrKey = normalizeKA_(contrName);
+
+  for (let i = 1; i < mailData.length; i++) {
+    if (normalizeKA_(mailData[i][iMContr]) === contrKey) {
+      emailInfo = {
+        client: mailData[i][iMail],
+        csm: mailData[i][iCSM]
+      };
+      break;
+    }
+  }
+
+  if (!emailInfo || !emailInfo.client) {
+    ui.alert("Не найдена почта клиента для: " + contrName);
+    return;
+  }
+
+  // определяем тип письма по "самой плохой" строке
+  let worstDaysDiff = -999999;
+  rowIdxs.forEach(i => {
+    const d = Number(data[i][iOver]);
+    if (Number.isFinite(d) && d > worstDaysDiff) worstDaysDiff = d;
+  });
+
+  let bucket = "1–3 дня до оплаты";
+  let intro = "Напоминаем о приближении срока оплаты по следующим счетам:";
+
+  if (worstDaysDiff >= 30) {
+    bucket = "Просрочка 30 дней";
+    intro = "По следующим счетам зафиксирована просрочка платежа:";
+  } else if (worstDaysDiff >= 7) {
+    bucket = "Просрочка 7 дней";
+    intro = "По следующим счетам зафиксирована просрочка платежа:";
+  } else if (worstDaysDiff >= 1) {
+    bucket = "Просрочка 1 день";
+    intro = "По следующим счетам зафиксирована просрочка платежа:";
+  } else if (worstDaysDiff >= -3) {
+    bucket = "1–3 дня до оплаты";
+    intro = "Напоминаем о приближении срока оплаты по следующим счетам:";
+  } else {
+    bucket = "Новый счёт";
+    intro = "Информируем, что в адрес вашей компании выставлены следующие счета:";
+  }
+
+  const subject = buildMailSubject_(bucket, contrName);
+
+  const idx = {};
+  idx[COLS.REGISTRY.NUMBER]  = iNum;
+  idx[COLS.REGISTRY.CONTR]   = iContr;
+  idx[COLS.REGISTRY.SUM]     = iSum;
+  idx[COLS.REGISTRY.DATE]    = iDate;
+  idx[COLS.REGISTRY.DUE]     = iDue;
+  idx[COLS.REGISTRY.COMMENT] = iComm;
+  idx[COLS.REGISTRY.FACT_INV_DATE] = header.indexOf("Фактическая дата счета");
+
+  const osChangedByRow = new Map();
+
+  const html = buildInvoiceEmailHtml_({
+    rowIdxs,
+    data,
+    idx,
+    osChangedByRow,
+    intro
+  });
+
+  GmailApp.sendEmail(
+    emailInfo.client,
+    subject,
+    "Ваш почтовый клиент не поддерживает HTML-формат письма.",
+    {
+      cc: emailInfo.csm || "",
+      htmlBody: html
+    }
+  );
+
+  const tz = getSpreadsheetTimeZone_();
+  const ts = Utilities.formatDate(new Date(), tz, `${DATE_FMT} HH:mm:ss`);
+
+  rowIdxs.forEach(i => {
+    data[i][iProc] = `Отправлено (ручной пуш: ${bucket})`;
+    data[i][iSent] = ts;
+  });
+
+  sheet.getRange(1, 1, data.length, header.length).setValues(data);
+
+  ui.alert(
+    `Письмо отправлено.\nКонтрагент: ${contrName}\nСчетов в письме: ${rowIdxs.length}\nТип: ${bucket}`
+  );
+}
+
+/** * ============================================================================
+ * VENTRA GO: PRO AUDIT & ANALYTICS MODULE
+ * Глубокая аналитика реестра: Дубли, ПДЗ, Стадии, Топ клиентов, Динамика
+ * ============================================================================
+ */
+
+function sendProAuditEmail() {
+  const ss = getMainSpreadsheet_();
+  const reestr = readSheet_(ss, CFG.SHEETS.REESTR);
+
+  if (!reestr.ok || reestr.values.length < 2) {
+    throw new Error("Реестр пуст или не найден");
+  }
+
+  // 1. ОПРЕДЕЛЕНИЕ КОЛОНОК (Расширенное)
+  const H = headerIndex_(reestr.values[0]);
+  
+  // Основные ключи
+  const cols = {
+    client: col_(H, "Контрагент"),
+    invoice: firstOf_(H, ["Номер", "Номер счета", "№ счета", "Invoice", "Счет"]),
+    dateDoc: firstOf_(H, ["Дата", "Дата счета", "Дата документа"]),
+    lastSend: col_(H, "Время последней отправки"),
+    
+    // Аналитические измерения
+    type: firstOf_(H, ["Тип", "Type"]),
+    status: col_(H, "Статус обработки"),
+    stage: firstOf_(H, ["Стадия", "Stage"]),
+    payment: firstOf_(H, ["Оплата", "Статус оплаты", "Payment status"]),
+    pdzReason: firstOf_(H, ["Причина ПДЗ", "ПДЗ", "Причина просрочки"]),
+    overdueDays: firstOf_(H, ["Просрочка, дней", "Просрочка (дней)", "Days overdue"]),
+    sum: firstOf_(H, ["Сумма", "Сумма счета", "Итого"]),
+  };
+
+  // 2. АГРЕГАЦИЯ ДАННЫХ
+  const data = {
+    totalRows: reestr.values.length - 1,
+    moneyTotal: 0,
+    
+    // Словари для подсчета
+    byType: new Map(),
+    byStatus: new Map(),
+    byStage: new Map(),
+    byPayment: new Map(),
+    byPdz: new Map(),
+    
+    // Дубли
+    dupsInvoice: new Map(), // По номеру счета
+    dupsCombo: new Map(),   // Клиент + Номер
+    
+    // Просрочка
+    overdueStats: { max: 0, sum: 0, count: 0, buckets: { "0":0, "1-7":0, "8-30":0, "30+":0 } },
+
+    // Клиенты (Топ)
+    clients: new Map() // name -> { total, sum, maxOverdue }
+  };
+
+  for (let r = 1; r < reestr.values.length; r++) {
+    const row = reestr.values[r];
+    
+    // Извлечение значений
+    const client = str_(row[cols.client]) || "(нет клиента)";
+    const inv = str_(cols.invoice !== -1 ? row[cols.invoice] : "");
+    const sum = moneyToNumber_(cols.sum !== -1 ? row[cols.sum] : 0);
+    const ovDays = (cols.overdueDays !== -1) ? (parseInt(row[cols.overdueDays]) || 0) : 0;
+    
+    data.moneyTotal += sum;
+
+    // Группировки (Counters)
+    inc_(data.byType, row, cols.type);
+    inc_(data.byStatus, row, cols.status);
+    inc_(data.byStage, row, cols.stage);
+    inc_(data.byPayment, row, cols.payment);
+    inc_(data.byPdz, row, cols.pdzReason);
+
+    // Дубли
+    if (inv) {
+      data.dupsInvoice.set(inv, (data.dupsInvoice.get(inv) || 0) + 1);
+      const combo = `${client}|${inv}`;
+      data.dupsCombo.set(combo, (data.dupsCombo.get(combo) || 0) + 1);
+    }
+
+    // Просрочка Статистика
+    if (ovDays > 0) {
+      data.overdueStats.max = Math.max(data.overdueStats.max, ovDays);
+      data.overdueStats.sum += ovDays;
+      data.overdueStats.count++;
+      
+      if (ovDays <= 7) data.overdueStats.buckets["1-7"]++;
+      else if (ovDays <= 30) data.overdueStats.buckets["8-30"]++;
+      else data.overdueStats.buckets["30+"]++;
+    } else {
+      data.overdueStats.buckets["0"]++;
+    }
+
+    // Клиентская статистика
+    if (!data.clients.has(client)) data.clients.set(client, { name: client, total: 0, sum: 0, maxOverdue: 0 });
+    const cObj = data.clients.get(client);
+    cObj.total++;
+    cObj.sum += sum;
+    if (ovDays > cObj.maxOverdue) cObj.maxOverdue = ovDays;
+  }
+
+  // 3. ПОСТ-ОБРАБОТКА (Сортировка и фильтрация дублей)
+  
+  // Оставляем только реальные дубли (>1)
+  const dupInvFinal = [...data.dupsInvoice.entries()].filter(x => x[1] > 1).sort((a,b) => b[1]-a[1]).slice(0, 10);
+  const dupComboFinal = [...data.dupsCombo.entries()].filter(x => x[1] > 1).sort((a,b) => b[1]-a[1]).slice(0, 10);
+
+  // Топ клиентов по деньгам
+  const topClients = [...data.clients.values()].sort((a,b) => b.sum - a.sum).slice(0, 10);
+
+  // Формируем модель
+  const model = {
+    generatedAt: Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "dd.MM.yyyy HH:mm"),
+    total: data.totalRows,
+    money: data.moneyTotal,
+    
+    // Списки для таблиц [Label, Count]
+    lists: {
+      type: mapToArr_(data.byType),
+      status: mapToArr_(data.byStatus),
+      stage: mapToArr_(data.byStage),
+      payment: mapToArr_(data.byPayment),
+      pdz: mapToArr_(data.byPdz)
+    },
+    
+    dups: { inv: dupInvFinal, combo: dupComboFinal, totalInv: dupInvFinal.length, totalCombo: dupComboFinal.length },
+    
+    overdue: {
+      avg: data.overdueStats.count ? Math.round(data.overdueStats.sum / data.overdueStats.count) : 0,
+      max: data.overdueStats.max,
+      buckets: data.overdueStats.buckets
+    },
+    
+    clients: topClients
+  };
+
+  MailApp.sendEmail({
+    to: CFG.OPS_EMAIL_TO,
+    subject: `GO PRO: Глубокий аудит реестра`,
+    htmlBody: htmlProAudit_(model, CFG.COLORS)
+  });
+}
+
+/** * ПОМОЩНИКИ ДЛЯ АУДИТА 
+ */
+function inc_(map, row, idx) {
+  if (idx === -1) return;
+  const val = str_(row[idx]) || "(пусто)";
+  map.set(val, (map.get(val) || 0) + 1);
+}
+
+function mapToArr_(map) {
+  return [...map.entries()]
+    .sort((a, b) => b[1] - a[1]) // Сортировка по убыванию
+    .slice(0, 12); // Топ 12 значений, чтобы не рвать верстку
+}
+
+/** * ============================================================================
+ * ВИЗУАЛИЗАЦИЯ PRO ОТЧЕТА (HTML)
+ * ============================================================================
+ */
+function htmlProAudit_(m, C) {
+  const css = `
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;800&family=Roboto:wght@400;500;700&display=swap');
+      body { margin:0; padding:0; background-color: ${C.BG}; font-family: 'Roboto', sans-serif; color: #333; }
+      .wrapper { width: 100%; padding: 20px 0; background: ${C.BG}; }
+      .container { max-width: 800px; margin: 0 auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+      
+      .header { background: linear-gradient(135deg, ${C.PRIMARY} 0%, #4a0072 100%); color: #fff; padding: 30px; text-align: center; }
+      .brand { font-family: 'Montserrat', sans-serif; font-size: 28px; font-weight: 800; }
+      .brand span { color: ${C.ACCENT}; }
+      
+      /* KPI GRID */
+      .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 20px; background: #fafafa; border-bottom: 1px solid #eee; }
+      .kpi-box { background: #fff; padding: 15px; border-radius: 8px; text-align: center; border: 1px solid #eee; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+      .kpi-val { font-size: 20px; font-weight: 700; color: ${C.PRIMARY}; display: block; margin-bottom: 4px; }
+      .kpi-lbl { font-size: 10px; text-transform: uppercase; color: #888; font-weight: 600; }
+      
+      /* SECTIONS */
+      .row { display: flex; gap: 20px; padding: 0 20px 20px 20px; }
+      .col { flex: 1; min-width: 0; }
+      .card { border: 1px solid #eee; border-radius: 8px; padding: 15px; height: 100%; }
+      .card-title { font-family: 'Montserrat', sans-serif; font-size: 14px; font-weight: 700; color: #444; margin-bottom: 12px; border-bottom: 2px solid ${C.PRIMARY}; padding-bottom: 5px; display: inline-block; }
+      
+      /* BARS & TABLES */
+      .stat-row { display: flex; align-items: center; margin-bottom: 6px; font-size: 11px; }
+      .stat-lbl { width: 100px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .stat-bar-box { flex: 1; background: #f0f0f0; height: 6px; border-radius: 3px; margin: 0 8px; }
+      .stat-bar { height: 100%; background: ${C.PRIMARY}; border-radius: 3px; }
+      .stat-val { width: 30px; text-align: right; font-weight: 600; }
+      
+      table { width: 100%; border-collapse: collapse; font-size: 11px; }
+      th { text-align: left; padding: 6px; background: #f4f4f4; color: #666; }
+      td { padding: 6px; border-bottom: 1px solid #f9f9f9; }
+      .num { text-align: right; font-weight: 600; }
+      .tag { padding: 2px 6px; border-radius: 4px; font-size: 10px; background: #eee; }
+      .warn { background: #FFEBEE; color: #C62828; }
+    </style>
+  `;
+
+  // Генератор мини-графиков (баров)
+  const renderBars = (list) => {
+    if (!list.length) return `<div style="color:#999;font-size:11px">Нет данных</div>`;
+    const max = Math.max(...list.map(x => x[1])) || 1;
+    return list.map(([lbl, val]) => `
+      <div class="stat-row">
+        <div class="stat-lbl" title="${lbl}">${lbl}</div>
+        <div class="stat-bar-box"><div class="stat-bar" style="width:${(val/max)*100}%"></div></div>
+        <div class="stat-val">${val}</div>
+      </div>
+    `).join("");
+  };
+
+  // Таблица дублей
+  let dupsHtml = `<div style="color:#999;font-size:11px">Дублей не найдено</div>`;
+  if (m.dups.inv.length || m.dups.combo.length) {
+    dupsHtml = `<table style="margin-bottom:10px"><tr><th>Дубли (Номер)</th><th class="num">Шт</th></tr>` +
+      m.dups.inv.map(x => `<tr><td>${x[0]}</td><td class="num warn">${x[1]}</td></tr>`).join("") + 
+      `</table>`;
+      
+    if (m.dups.combo.length) {
+      dupsHtml += `<table><tr><th>Дубли (Клиент+Номер)</th><th class="num">Шт</th></tr>` +
+        m.dups.combo.map(x => `<tr><td>${x[0].split('|').join('<br>')}</td><td class="num warn">${x[1]}</td></tr>`).join("") + 
+        `</table>`;
+    }
+  }
+
+  // Топ клиентов
+  const clientsHtml = `<table><tr><th>Клиент</th><th class="num">Сумма</th><th class="num">Max Over</th></tr>` +
+    m.clients.map(c => `<tr>
+      <td>${c.name}</td>
+      <td class="num" style="color:${C.SUCCESS}">${moneyRu_(c.sum)}</td>
+      <td class="num" style="color:${c.maxOverdue>30?C.ACCENT:'#888'}">${c.maxOverdue} д.</td>
+    </tr>`).join("") + `</table>`;
+
+  return `
+    <html><head>${css}</head><body>
+      <div class="wrapper"><div class="container">
+        
+        <div class="header">
+          <div class="brand">VENTRA <span>GO</span></div>
+          <div style="font-size:12px; opacity:0.8; margin-top:5px">PRO Analytics Report</div>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi-box"><span class="kpi-val">${m.total}</span><span class="kpi-lbl">Всего строк</span></div>
+          <div class="kpi-box"><span class="kpi-val" style="color:${C.SUCCESS}">${moneyRu_(m.money)}</span><span class="kpi-lbl">Сумма реестра</span></div>
+          <div class="kpi-box"><span class="kpi-val" style="color:${C.ACCENT}">${m.dups.totalInv}</span><span class="kpi-lbl">Дубли (Счета)</span></div>
+          <div class="kpi-box"><span class="kpi-val">${m.overdue.avg}</span><span class="kpi-lbl">Ср. Просрочка (дней)</span></div>
+        </div>
+
+        <div class="row" style="margin-top:20px">
+          <div class="col"><div class="card">
+            <div class="card-title">Статус обработки</div>
+            ${renderBars(m.lists.status)}
+          </div></div>
+          <div class="col"><div class="card">
+            <div class="card-title">Тип отправки</div>
+            ${renderBars(m.lists.type)}
+          </div></div>
+        </div>
+
+        <div class="row">
+          <div class="col"><div class="card">
+            <div class="card-title">Стадия (CRM)</div>
+            ${renderBars(m.lists.stage)}
+          </div></div>
+          <div class="col"><div class="card">
+            <div class="card-title">Статус Оплаты</div>
+            ${renderBars(m.lists.payment)}
+          </div></div>
+        </div>
+
+        <div class="row">
+          <div class="col"><div class="card">
+            <div class="card-title" style="border-color:${C.ACCENT}">Причина ПДЗ</div>
+            ${renderBars(m.lists.pdz)}
+          </div></div>
+          <div class="col"><div class="card">
+            <div class="card-title" style="border-color:${C.ACCENT}">Сроки просрочки</div>
+            ${renderBars(Object.entries(m.overdue.buckets))}
+          </div></div>
+        </div>
+
+        <div class="row">
+          <div class="col"><div class="card">
+            <div class="card-title" style="border-color:${C.ACCENT}">Дубликаты данных</div>
+            ${dupsHtml}
+          </div></div>
+          <div class="col" style="flex:1.5"><div class="card">
+            <div class="card-title">Топ-10 Клиентов (Объем)</div>
+            ${clientsHtml}
+          </div></div>
+        </div>
+
+        <div style="text-align:center; padding:20px; font-size:10px; color:#999; border-top:1px solid #eee">
+          Generated: ${m.generatedAt}
+        </div>
+
+      </div></div>
+    </body></html>
+  `;
+}
