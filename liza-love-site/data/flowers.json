@@ -1,0 +1,114 @@
+[
+  {
+    "id": 1,
+    "image": "images/flowers/01-white-lilies.jpg",
+    "date": "2024-03-01",
+    "title": "Белые лилии",
+    "caption": "Первый букет — белые махровые лилии в белой упаковке."
+  },
+  {
+    "id": 2,
+    "image": "images/flowers/02-red-roses.jpg",
+    "date": "2024-03-15",
+    "title": "Красные розы",
+    "caption": "Глубокие красные розы с эвкалиптом — классика без компромиссов."
+  },
+  {
+    "id": 3,
+    "image": "images/flowers/03-white-roses.jpg",
+    "date": "2024-03-29",
+    "title": "Белые розы",
+    "caption": "Белые розы и альстромерии — чистота и нежность."
+  },
+  {
+    "id": 4,
+    "image": "images/flowers/04-pink-spray-roses.jpg",
+    "date": "2024-04-12",
+    "title": "Розовые кустовые розы",
+    "caption": "Облако розовых кустовых роз у окна."
+  },
+  {
+    "id": 5,
+    "image": "images/flowers/05-blue-tulips.jpg",
+    "date": "2024-04-26",
+    "title": "Синие тюльпаны",
+    "caption": "Пионовидные синие тюльпаны в чёрной упаковке — дерзко и красиво."
+  },
+  {
+    "id": 6,
+    "image": "images/flowers/06-pink-lilies.jpg",
+    "date": "2024-05-10",
+    "title": "Розово-белые лилии",
+    "caption": "Махровые лилии с персиковой розой — как маленький фейерверк."
+  },
+  {
+    "id": 7,
+    "image": "images/flowers/07-mixed-tsvet.jpg",
+    "date": "2024-05-24",
+    "title": "Букет TSVET",
+    "caption": "Лилии, розы и гвоздики — целая история в одном букете."
+  },
+  {
+    "id": 8,
+    "image": "images/flowers/08-red-white-vase.jpg",
+    "date": "2024-06-07",
+    "title": "Красное и белое",
+    "caption": "Красные и белые розы в вазе — контраст, который говорит сам за себя."
+  },
+  {
+    "id": 9,
+    "image": "images/flowers/09-lilac-collection.jpg",
+    "date": "2024-06-21",
+    "title": "Сирень и коллекция",
+    "caption": "Сирень, розы, шляпная коробка и вечная роза под колпаком."
+  },
+  {
+    "id": 10,
+    "image": "images/flowers/10-pride-prejudice.jpg",
+    "date": "2024-07-05",
+    "title": "«Гордость и предубеждение»",
+    "caption": "Букет с открыткой к моменту из фильма — 1:50."
+  },
+  {
+    "id": 11,
+    "image": "images/flowers/11-burgundy-cream.jpg",
+    "date": "2024-07-19",
+    "title": "Бордовые и кремовые",
+    "caption": "Бархатные бордовые и тёплые кремовые розы вплотную друг к другу."
+  },
+  {
+    "id": 12,
+    "image": "images/flowers/12-pastel-mixed.jpg",
+    "date": "2024-08-02",
+    "title": "Пастельный букет",
+    "caption": "Розовые розы, лилии и альстромерии в мягких тонах."
+  },
+  {
+    "id": 13,
+    "image": "images/flowers/13-ring-roses.jpg",
+    "date": "2024-08-16",
+    "title": "Кольцо и розы",
+    "caption": "Розовые розы и кольцо — самый важный букет из всех."
+  },
+  {
+    "id": 14,
+    "image": "images/flowers/14-lilac-surprise.jpg",
+    "date": "2024-08-30",
+    "title": "Сирень",
+    "caption": "Пышная сирень — аромат, который хочется сохранить навсегда."
+  },
+  {
+    "id": 15,
+    "image": "images/flowers/15-basket-roses.jpg",
+    "date": "2024-09-13",
+    "title": "Розы в корзине",
+    "caption": "Розово-персиковые розы в белой корзине с бантом."
+  },
+  {
+    "id": 16,
+    "image": "images/flowers/16-pink-peonies.jpg",
+    "date": "2024-09-27",
+    "title": "Розовые пионы",
+    "caption": "Огромный букет нежно-розовых пионов — мягкость и объём."
+  }
+]
