@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Сайт любви для Лизы — ритуал цветов каждые две недели">
+  <title>Для Лизы — с любовью</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Manrope:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="page-bg" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <nav class="nav">
+      <a class="nav-logo" href="#top">Лиза ♥</a>
+      <div class="nav-links">
+        <a href="#flower-ritual">Ритуал цветов</a>
+        <a href="#gallery">Галерея</a>
+      </div>
+    </nav>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <p class="hero-eyebrow">Только для тебя</p>
+      <h1 class="hero-title">Лиза,<br><em>ты — мой самый красивый день</em></h1>
+      <p class="hero-text">
+        Этот сайт — маленький уголок, где я собираю всё самое нежное:
+        цветы, моменты и обещание, что любовь не заканчивается.
+      </p>
+      <a class="hero-cta" href="#flower-ritual">Смотреть ритуал цветов</a>
+    </section>
+
+    <section id="flower-ritual" class="flower-ritual">
+      <div class="section-intro">
+        <span class="section-tag">Каждые две недели</span>
+        <h2>Ритуал цветов</h2>
+        <p class="section-lead">
+          Раз в две недели — новый букет. Не потому что нужен повод,
+          а потому что ты заслуживаешь, чтобы тебя радовали постоянно.
+          Здесь — вся наша цветочная история.
+        </p>
+        <div class="ritual-stats" id="ritual-stats">
+          <div class="stat">
+            <span class="stat-value" id="stat-count">—</span>
+            <span class="stat-label">букетов</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-weeks">—</span>
+            <span class="stat-label">недель вместе в цветах</span>
+          </div>
+          <div class="stat">
+            <span class="stat-value" id="stat-latest">—</span>
+            <span class="stat-label">последний букет</span>
+          </div>
+        </div>
+      </div>
+
+      <article class="featured-bouquet" id="featured-bouquet" aria-label="Последний букет">
+        <div class="featured-image-wrap">
+          <img class="featured-image" id="featured-image" src="" alt="" loading="eager">
+          <div class="featured-badge">Последний букет</div>
+        </div>
+        <div class="featured-content">
+          <time class="featured-date" id="featured-date"></time>
+          <h3 class="featured-title" id="featured-title"></h3>
+          <p class="featured-caption" id="featured-caption"></p>
+          <button class="featured-open" id="featured-open" type="button">Открыть в полном размере</button>
+        </div>
+      </article>
+    </section>
+
+    <section id="gallery" class="gallery-section">
+      <div class="section-intro section-intro--compact">
+        <span class="section-tag">Хронология</span>
+        <h2>Все букеты</h2>
+        <p class="section-lead section-lead--compact">
+          Листай, нажимай — каждый букет со своей датой и историей.
+        </p>
+      </div>
+
+      <div class="gallery-controls">
+        <button class="filter-btn is-active" type="button" data-filter="all">Все</button>
+        <button class="filter-btn" type="button" data-filter="recent">Последние 6</button>
+      </div>
+
+      <div class="flower-timeline" id="flower-timeline" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Сделано с любовью для Лизы · <span id="footer-year"></span></p>
+  </footer>
+
+  <div class="lightbox" id="lightbox" hidden role="dialog" aria-modal="true" aria-label="Просмотр букета">
+    <button class="lightbox-close" type="button" aria-label="Закрыть">&times;</button>
+    <button class="lightbox-nav lightbox-prev" type="button" aria-label="Предыдущий букет">&#8592;</button>
+    <button class="lightbox-nav lightbox-next" type="button" aria-label="Следующий букет">&#8594;</button>
+    <div class="lightbox-inner">
+      <img class="lightbox-image" id="lightbox-image" src="" alt="">
+      <div class="lightbox-meta">
+        <time class="lightbox-date" id="lightbox-date"></time>
+        <h3 class="lightbox-title" id="lightbox-title"></h3>
+        <p class="lightbox-caption" id="lightbox-caption"></p>
+        <p class="lightbox-counter" id="lightbox-counter"></p>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/flowers.js" type="module"></script>
+</body>
+</html>
